@@ -10,7 +10,7 @@ LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop brows
   - Camera source (`getUserMedia`) for phone testing
   - Video file source for desktop dev testing
   - WebRTC connect/disconnect flow
-  - Data-channel event log and optional TTS
+  - Browser speech recognition questions and spoken answer playback
   - Overlay canvas scaffold for detection boxes
 - `api/` (FastAPI + aiortc)
   - `POST /webrtc/offer`
@@ -36,8 +36,8 @@ LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop brows
 - Python 3.11+ and `pip` (for local backend workflow)
 - Node.js 18+ and npm (for local frontend workflow)
 - `mkcert` (optional, but recommended for real phone camera testing)
-- `ffmpeg` for local audio conversion and MP3 encoding
-- A local Vosk model directory for offline speech recognition
+- `ffmpeg` for backend MP3 answer encoding
+- A browser with Web Speech API support for voice questions
 
 ## Environment file
 
@@ -50,12 +50,18 @@ cp .env.example .env
 Default `.env.example`:
 
 ```bash
-VITE_SIGNALING_BASE_URL=http://localhost:8000
+VITE_SIGNALING_BASE_URL=/api
+VITE_RTC_ICE_SERVERS=stun:stun.l.google.com:19302
+RTC_ICE_SERVERS=stun:stun.l.google.com:19302
 ANALYSIS_TARGET_FPS=5
 ENABLE_MOCK_RESULTS=false
 ```
 
 `ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
+
+`VITE_SIGNALING_BASE_URL=/api` lets Vite proxy signaling to the backend and avoids iPhone Safari trying to call `localhost` on the phone or blocking mixed-content API calls.
+
+`VITE_RTC_ICE_SERVERS` and `RTC_ICE_SERVERS` are comma-separated STUN/TURN URLs used by the browser and API peer connections. The default STUN server improves iPhone/LAN connectivity.
 
 Optional backend env var:
 
@@ -105,12 +111,6 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Set your Vosk model path before starting the API if you do not place the model at `api/models/vosk-model`:
-
-```bash
-export VOSK_MODEL_PATH=/absolute/path/to/vosk-model-small-en-us-0.15
-```
-
 Optional SmolVLM settings:
 
 ```bash
@@ -131,6 +131,7 @@ npm run dev -- --host 0.0.0.0 --port 5173
 
 - Connect phone and dev machine to the same Wi-Fi.
 - Camera access on mobile browsers generally requires HTTPS (or localhost).
+- Keep matching `VITE_RTC_ICE_SERVERS` and `RTC_ICE_SERVERS` values when testing from iPhone; use a TURN server here if STUN is not enough for your network.
 - If you open `http://<your-dev-machine-ip>:5173`, some browsers may block `getUserMedia` and show `navigator.mediaDevices` as undefined.
 - Allow camera access when prompted.
 - In the UI, select `Phone Camera`, click `Start Source`, then `Connect`.
@@ -276,7 +277,7 @@ scripts/clean-session-artifacts.sh /tmp/lens-plus-artifacts
 
 ## Debugging SmolVLM
 
-You can test the SmolVLM backend integration directly without recording audio.
+You can test the SmolVLM backend integration directly without using the voice UI.
 
 Test with a tiny generated image:
 
@@ -294,10 +295,10 @@ curl -X POST http://localhost:8000/debug/vision \
   -d '{"session_id": "YOUR_SESSION_ID", "question": "What is in this image?"}'
 ```
 
-## Audio question flow
+## Voice question flow
 
 - Start a source and connect.
 - Click `Record Question`, speak, then click `Stop And Send`.
-- The frontend sends the recorded audio over the existing WebRTC data channel as `question_audio`.
-- The backend converts the audio for Vosk, transcribes it offline, queries SmolVLM with the latest frame, and returns `answer`, `transcript`, and `audio_base64`.
+- The frontend uses browser speech recognition and sends the transcript over the existing WebRTC data channel as `question_text`.
+- The backend queries SmolVLM with the latest frame and returns `answer`, `transcript`, and `audio_base64`.
 - The frontend displays the answer text and plays the returned MP3.

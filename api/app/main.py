@@ -12,7 +12,6 @@ import subprocess
 import tempfile
 import threading
 import uuid
-import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,20 +21,20 @@ from typing import Any
 
 import av.logging
 import torch
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import (
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
 from aiortc.sdp import candidate_from_sdp
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
 from transformers import Idefics3ForConditionalGeneration, Idefics3Processor
-from vosk import KaldiRecognizer, Model as VoskModel, SetLogLevel
 
 
-SetLogLevel(-1)
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_VOSK_MODEL_PATH = BASE_DIR / "models" / "vosk-model"
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 SAY_BIN = shutil.which("say")
 ESPEAK_BIN = shutil.which("espeak-ng") or shutil.which("espeak")
@@ -50,9 +49,8 @@ ENABLE_MOCK_RESULTS = os.getenv("ENABLE_MOCK_RESULTS", "false").strip().lower() 
     "yes",
     "on",
 }
+DEFAULT_RTC_ICE_SERVER_URLS = ["stun:stun.l.google.com:19302"]
 
-_vosk_model: VoskModel | None = None
-_vosk_model_lock = threading.Lock()
 _smolvlm_processor: Idefics3Processor | None = None
 _smolvlm_model: Idefics3ForConditionalGeneration | None = None
 _smolvlm_lock = threading.Lock()
@@ -117,6 +115,20 @@ def load_analysis_target_fps_from_env() -> float:
 CONFIGURED_ANALYSIS_TARGET_FPS = load_analysis_target_fps_from_env()
 
 
+def load_rtc_ice_servers_from_env() -> list[RTCIceServer]:
+    raw_value = os.getenv("RTC_ICE_SERVERS")
+    urls = (
+        DEFAULT_RTC_ICE_SERVER_URLS
+        if raw_value is None
+        else [url.strip() for url in raw_value.split(",") if url.strip()]
+    )
+
+    return [RTCIceServer(urls=url) for url in urls]
+
+
+RTC_CONFIGURATION = RTCConfiguration(iceServers=load_rtc_ice_servers_from_env())
+
+
 def load_session_artifacts_root_from_env() -> Path:
     raw_value = os.getenv("SESSION_ARTIFACTS_DIR")
     if raw_value:
@@ -159,7 +171,6 @@ class Session:
     dumped_frames: int = 0
     dump_errors: int = 0
     last_dump_error: str | None = None
-    pending_audio_chunks: dict[str, list[str]] = field(default_factory=dict)
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -177,33 +188,6 @@ DEFAULT_FALLBACK_ANSWER = "Sorry, I didn't get that."
 logger = logging.getLogger("lens-plus.api")
 
 
-def get_vosk_model_path() -> Path:
-    configured_path = os.getenv("VOSK_MODEL_PATH")
-    if configured_path:
-        return Path(configured_path).expanduser()
-    return DEFAULT_VOSK_MODEL_PATH
-
-
-def get_vosk_model() -> VoskModel:
-    global _vosk_model
-
-    if _vosk_model is not None:
-        return _vosk_model
-
-    model_path = get_vosk_model_path()
-    if not model_path.exists():
-        raise AudioProcessingError(
-            "Vosk model files were not found. Set VOSK_MODEL_PATH or place a model at "
-            f"{model_path}"
-        )
-
-    with _vosk_model_lock:
-        if _vosk_model is None:
-            _vosk_model = VoskModel(str(model_path))
-
-    return _vosk_model
-
-
 def run_subprocess(command: list[str], failure_message: str) -> None:
     try:
         subprocess.run(
@@ -219,80 +203,6 @@ def run_subprocess(command: list[str], failure_message: str) -> None:
         if details:
             raise AudioProcessingError(f"{failure_message}: {details}") from error
         raise AudioProcessingError(failure_message) from error
-
-
-def convert_audio_bytes_to_wav(audio_bytes: bytes) -> Path:
-    if not audio_bytes:
-        raise AudioProcessingError("Received empty audio data")
-
-    with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as source_file:
-        source_file.write(audio_bytes)
-        source_path = Path(source_file.name)
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as target_file:
-        target_path = Path(target_file.name)
-
-    try:
-        run_subprocess(
-            [
-                FFMPEG_BIN,
-                "-y",
-                "-i",
-                str(source_path),
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                str(target_path),
-            ],
-            "Failed to convert the uploaded audio into Vosk-compatible PCM WAV",
-        )
-        return target_path
-    finally:
-        source_path.unlink(missing_ok=True)
-
-
-def transcribe_audio_sync(audio_bytes: bytes) -> str:
-    wav_path = convert_audio_bytes_to_wav(audio_bytes)
-
-    try:
-        with wave.open(str(wav_path), "rb") as wav_file:
-            if wav_file.getnchannels() != 1:
-                raise AudioProcessingError("Transcription audio must be mono after conversion")
-            if wav_file.getsampwidth() != 2:
-                raise AudioProcessingError("Transcription audio must be 16-bit PCM after conversion")
-
-            recognizer = KaldiRecognizer(get_vosk_model(), wav_file.getframerate())
-            recognizer.SetWords(True)
-
-            parts: list[str] = []
-            while True:
-                chunk = wav_file.readframes(4000)
-                if not chunk:
-                    break
-                if recognizer.AcceptWaveform(chunk):
-                    result = json.loads(recognizer.Result())
-                    text = str(result.get("text", "")).strip()
-                    if text:
-                        parts.append(text)
-
-            final_result = json.loads(recognizer.FinalResult())
-            final_text = str(final_result.get("text", "")).strip()
-            if final_text:
-                parts.append(final_text)
-
-            transcript = " ".join(parts).strip()
-            if not transcript:
-                raise AudioProcessingError("Transcription was empty")
-
-            return transcript
-    except wave.Error as error:
-        raise AudioProcessingError(f"Converted audio could not be decoded as WAV: {error}") from error
-    finally:
-        wav_path.unlink(missing_ok=True)
 
 
 def synthesize_speech_sync(text: str) -> bytes:
@@ -368,10 +278,6 @@ async def send_error(session: Session, text: str) -> None:
 
 async def text_to_speech_bytes(text: str) -> bytes:
     return await asyncio.to_thread(synthesize_speech_sync, text)
-
-
-async def transcribe_audio(audio_bytes: bytes) -> str:
-    return await asyncio.to_thread(transcribe_audio_sync, audio_bytes)
 
 
 def query_image_model_sync(image_bytes: bytes, question: str) -> str:
@@ -540,67 +446,6 @@ async def run_text_pipeline(session: Session, text: str) -> None:
         await send_error(session, f"Failed to return the answer audio: {error}")
 
 
-async def run_ai_pipeline(session: Session, audio_bytes: bytes) -> None:
-    if session.latest_jpeg is None:
-        await send_error(session, "No image frame available yet")
-        return
-
-    logger.info(
-        "Running audio pipeline audio_bytes=%d has_snapshot=%s",
-        len(audio_bytes),
-        session.latest_jpeg is not None,
-    )
-    await send_status(session, "Transcribing audio...")
-
-    try:
-        logger.info("Starting Vosk transcription")
-        transcript = await transcribe_audio(audio_bytes)
-        logger.info("Finished Vosk transcription transcript_len=%d transcript=%r", len(transcript), transcript)
-    except AudioProcessingError as error:
-        await send_fallback_answer(session, status_message=str(error))
-        return
-    except Exception as error:
-        await send_fallback_answer(session, status_message=f"Audio transcription failed: {error}")
-        return
-
-    if not transcript.strip():
-        await send_fallback_answer(session, status_message="Transcription was empty")
-        return
-
-    await send_status(session, "Querying image model...")
-
-    try:
-        logger.info("Querying SmolVLM for audio pipeline")
-        answer = await query_image_model(session.latest_jpeg, transcript)
-        logger.info("SmolVLM answer received answer_len=%d", len(answer))
-    except VisionModelError as error:
-        await send_fallback_answer(session, transcript=transcript, status_message=str(error))
-        return
-    except Exception as error:
-        await send_fallback_answer(
-            session,
-            transcript=transcript,
-            status_message=f"SmolVLM query failed: {error}",
-        )
-        return
-
-    await send_status(session, "Generating speech...")
-
-    if not answer.strip():
-        await send_fallback_answer(session, transcript=transcript)
-        return
-
-    try:
-        logger.info("Generating and returning answer audio")
-        await send_answer(session, answer, transcript=transcript)
-    except AudioProcessingError as error:
-        await send_error(session, str(error))
-        return
-    except Exception as error:
-        await send_error(session, f"Speech generation failed: {error}")
-        return
-
-
 async def handle_client_message(session: Session, message: Any) -> None:
     session.updated_at = datetime.now(timezone.utc)
 
@@ -610,81 +455,13 @@ async def handle_client_message(session: Session, message: Any) -> None:
 
         data = json.loads(message)
         msg_type = data.get("type")
-        if msg_type == "question_audio":
-            logger.info("Parsed data-channel message type=question_audio")
-        elif msg_type == "question_audio_chunk":
-            logger.info("Parsed data-channel message type=question_audio_chunk")
-        else:
-            logger.info("Parsed data-channel message type=%s", msg_type)
+        logger.info("Parsed data-channel message type=%s", msg_type)
 
-        if msg_type == "question_audio":
-            audio_base64 = data.get("audio_base64")
-            if not isinstance(audio_base64, str) or not audio_base64:
-                await send_error(session, "No audio provided")
-                return
-
-            try:
-                audio_bytes = base64.b64decode(audio_base64, validate=True)
-                logger.info("Decoded question_audio bytes=%d", len(audio_bytes))
-            except Exception:
-                await send_error(session, "Audio payload was not valid base64")
-                return
-
-            await run_ai_pipeline(session, audio_bytes)
-        elif msg_type == "question_audio_chunk":
-            upload_id = str(data.get("upload_id", "")).strip()
-            chunk_index = data.get("chunk_index")
-            total_chunks = data.get("total_chunks")
-            chunk_data = data.get("chunk_data")
-
-            if not upload_id:
-                await send_error(session, "Missing upload id for audio chunk")
-                return
-            if not isinstance(chunk_index, int) or not isinstance(total_chunks, int):
-                await send_error(session, "Invalid audio chunk metadata")
-                return
-            if not isinstance(chunk_data, str) or not chunk_data:
-                await send_error(session, "Missing audio chunk data")
-                return
-            if total_chunks <= 0 or chunk_index < 0 or chunk_index >= total_chunks:
-                await send_error(session, "Audio chunk indexes were out of range")
-                return
-
-            logger.info(
-                "Received audio chunk upload_id=%s chunk=%d/%d size=%d",
-                upload_id,
-                chunk_index + 1,
-                total_chunks,
-                len(chunk_data),
+        if msg_type in {"question_audio", "question_audio_chunk"}:
+            await send_error(
+                session,
+                "Audio uploads are no longer supported. Send question_text instead.",
             )
-
-            parts = session.pending_audio_chunks.setdefault(upload_id, [""] * total_chunks)
-            if len(parts) != total_chunks:
-                session.pending_audio_chunks.pop(upload_id, None)
-                await send_error(session, "Audio chunk count changed during upload")
-                return
-
-            parts[chunk_index] = chunk_data
-
-            if any(part == "" for part in parts):
-                return
-
-            session.pending_audio_chunks.pop(upload_id, None)
-            audio_base64 = "".join(parts)
-            logger.info(
-                "Reassembled chunked audio upload_id=%s total_base64_size=%d",
-                upload_id,
-                len(audio_base64),
-            )
-
-            try:
-                audio_bytes = base64.b64decode(audio_base64, validate=True)
-                logger.info("Decoded chunked question_audio bytes=%d", len(audio_bytes))
-            except Exception:
-                await send_error(session, "Chunked audio payload was not valid base64")
-                return
-
-            await run_ai_pipeline(session, audio_bytes)
         elif msg_type == "question_text":
             text = str(data.get("text", "")).strip()
             if not text:
@@ -862,7 +639,7 @@ async def offer(payload: OfferRequest) -> OfferResponse:
     for existing_session_id in list(sessions.keys()):
         await close_session(existing_session_id)
 
-    peer_connection = RTCPeerConnection()
+    peer_connection = RTCPeerConnection(configuration=RTC_CONFIGURATION)
 
     session_id = payload.session_id or str(uuid.uuid4())
     session_started_at = datetime.now(timezone.utc)

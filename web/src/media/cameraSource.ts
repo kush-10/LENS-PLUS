@@ -30,10 +30,38 @@ export async function startCameraStream(targetFramerate = 15): Promise<MediaStre
     };
   }
 
-  return navigator.mediaDevices.getUserMedia({
-    audio: true,
-    video: videoConstraints
-  });
+  const fallbackConstraints: MediaStreamConstraints[] = [
+    { audio: false, video: videoConstraints },
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: idealWidth },
+        height: { ideal: idealHeight }
+      }
+    },
+    { audio: false, video: { facingMode: { ideal: "environment" } } },
+    { audio: false, video: true }
+  ];
+
+  let lastError: unknown = null;
+  for (const constraints of fallbackConstraints) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(`Unable to start camera: ${formatCameraError(lastError)}`);
+}
+
+function formatCameraError(error: unknown): string {
+  if (error instanceof DOMException) {
+    return error.message ? `${error.name}: ${error.message}` : error.name;
+  }
+
+  return String(error);
 }
 
 export function stopStream(stream: MediaStream | null): void {

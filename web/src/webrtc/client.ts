@@ -4,6 +4,9 @@ type ConnectionStateHandler = (state: RTCPeerConnectionState) => void;
 type DataMessageHandler = (data: string) => void;
 type LogHandler = (message: string) => void;
 
+const DEFAULT_ICE_SERVER_URLS = ["stun:stun.l.google.com:19302"];
+const ICE_SERVERS = loadIceServers();
+
 export class WebRtcClient {
   private peerConnection: RTCPeerConnection | null = null;
   private videoSender: RTCRtpSender | null = null;
@@ -33,7 +36,7 @@ export class WebRtcClient {
       await this.disconnect();
     }
 
-    const peerConnection = new RTCPeerConnection({ iceServers: [] });
+    const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     this.peerConnection = peerConnection;
     this.videoSender = null;
     this.pendingIceCandidates = [];
@@ -167,6 +170,23 @@ export class WebRtcClient {
     this.pendingIceCandidates = [];
     this.connectionStateHandler("closed");
   }
+}
+
+function loadIceServers(): RTCIceServer[] {
+  const configuredUrls = import.meta.env.VITE_RTC_ICE_SERVERS;
+  const urls =
+    typeof configuredUrls === "string"
+      ? splitIceServerUrls(configuredUrls)
+      : DEFAULT_ICE_SERVER_URLS;
+
+  return urls.map((url) => ({ urls: url }));
+}
+
+function splitIceServerUrls(value: string): string[] {
+  return value
+    .split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
 }
 
 async function waitForIceGathering(

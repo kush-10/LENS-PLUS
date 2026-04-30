@@ -10,6 +10,49 @@ type PageName = "home" | "camera" | "voice" | "admin";
 type ThemeName = "dark" | "light";
 type StatusTone = "up" | "warn" | "down" | "neutral";
 
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultLike = {
+  readonly isFinal: boolean;
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionAlternativeLike;
+};
+
+type SpeechRecognitionResultListLike = {
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionResultLike;
+};
+
+type SpeechRecognitionEventLike = Event & {
+  readonly results: SpeechRecognitionResultListLike;
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  readonly error?: string;
+  readonly message?: string;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
+
 const SEND_TARGET_FPS = 30;
 const ADMIN_PREVIEW_POLL_MS = 750;
 const THEME_STORAGE_KEY = "lensplus-theme";
@@ -189,6 +232,7 @@ app.innerHTML = `
       <div class="camera-wrap">
         <video id="camera-preview" autoplay muted playsinline></video>
       </div>
+      <p id="camera-status" class="camera-status">Camera idle.</p>
       <button id="start-feed" class="primary">Start Feed</button>
     </section>
 
@@ -214,6 +258,16 @@ app.innerHTML = `
         <div class="button-row">
           <button id="record-question" class="primary">Record Question</button>
           <button id="stop-question" class="ghost">Stop And Send</button>
+        </div>
+
+        <div class="manual-question">
+          <label for="manual-question-text">Question text fallback</label>
+          <textarea
+            id="manual-question-text"
+            rows="3"
+            placeholder="Type a question if voice recognition is unavailable."
+          ></textarea>
+          <button id="send-manual-question" class="ghost">Send Text Question</button>
         </div>
 
         <p>Status: <strong id="status">idle</strong></p>
@@ -318,6 +372,7 @@ const startFeedEl = mustQuery<HTMLButtonElement>("#start-feed");
 const voiceFeedToggleEl = mustQuery<HTMLButtonElement>("#voice-feed-toggle");
 const cameraPreviewEl = mustQuery<HTMLVideoElement>("#camera-preview");
 const voicePreviewEl = mustQuery<HTMLVideoElement>("#voice-preview");
+const cameraStatusEl = mustQuery<HTMLElement>("#camera-status");
 const voicePreviewStatusEl = mustQuery<HTMLElement>("#voice-preview-status");
 const adminLivePreviewEl = mustQuery<HTMLImageElement>("#admin-live-preview");
 const adminLiveStatusEl = mustQuery<HTMLElement>("#admin-live-status");
@@ -331,6 +386,8 @@ const statusSessionIdEl = mustQuery<HTMLElement>("#status-session-id");
 const statusSessionCountEl = mustQuery<HTMLElement>("#status-session-count");
 const recordQuestionEl = mustQuery<HTMLButtonElement>("#record-question");
 const stopQuestionEl = mustQuery<HTMLButtonElement>("#stop-question");
+const manualQuestionTextEl = mustQuery<HTMLTextAreaElement>("#manual-question-text");
+const sendManualQuestionEl = mustQuery<HTMLButtonElement>("#send-manual-question");
 const statusSendFpsEl = mustQuery<HTMLElement>("#status-send-fps");
 const statusAnalysisFpsEl = mustQuery<HTMLElement>("#status-analysis-fps");
 const statusIncomingFpsEl = mustQuery<HTMLElement>("#status-incoming-fps");
@@ -341,11 +398,10 @@ const eventLogEl = mustQuery<HTMLUListElement>("#event-log");
 
 let activeStream: MediaStream | null = null;
 let activeSessionId: string | null = null;
-let questionRecorder: MediaRecorder | null = null;
-let questionChunks: Blob[] = [];
+let questionRecognition: SpeechRecognitionLike | null = null;
+let questionTranscript = "";
 let audioResponsePlayer: HTMLAudioElement | null = null;
-let discardRecordedQuestion = false;
-const AUDIO_CHUNK_SIZE = 16_000;
+let discardQuestionTranscript = false;
 let peerState: RTCPeerConnectionState = "closed";
 const sendTargetFps = SEND_TARGET_FPS;
 let latestHealthStatus = "unknown";
@@ -360,7 +416,14 @@ const logger = new UiLogger(eventLogEl);
 const apiBaseUrl = getSignalingBaseUrl();
 const errorCache = new Map<string, string>();
 
+prepareInlineVideo(cameraPreviewEl);
+prepareInlineVideo(voicePreviewEl);
 showAdminLiveStatus("No active session.");
+setCameraStatus(
+  window.isSecureContext
+    ? `Camera idle. Signaling: ${apiBaseUrl}`
+    : "iPhone Safari requires HTTPS for camera access."
+);
 
 adminLivePreviewEl.addEventListener("load", () => {
   adminLivePreviewEl.hidden = false;
@@ -431,7 +494,15 @@ cameraPreviewEl.addEventListener("loadedmetadata", () => {
   updateViewportLayout();
 });
 
+cameraPreviewEl.addEventListener("canplay", () => {
+  updateViewportLayout();
+});
+
 voicePreviewEl.addEventListener("loadedmetadata", () => {
+  updateVoicePreviewState();
+});
+
+voicePreviewEl.addEventListener("canplay", () => {
   updateVoicePreviewState();
 });
 
@@ -463,13 +534,30 @@ window.setInterval(() => {
 }, ADMIN_PREVIEW_POLL_MS);
 
 window.addEventListener("beforeunload", () => {
+  cleanupMediaSession();
+});
+
+window.addEventListener("pagehide", () => {
+  cleanupMediaSession();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && activeStream) {
+    void playPreviewVideo(cameraPreviewEl);
+    void playPreviewVideo(voicePreviewEl);
+  }
+});
+
+function cleanupMediaSession(): void {
   resetQuestionRecorder();
   if (audioResponsePlayer) {
     audioResponsePlayer.pause();
   }
   stopStream(activeStream);
+  activeStream = null;
+  attachStreamsToPreviews(null);
   void webrtc.disconnect();
-});
+}
 
 recordQuestionEl.addEventListener("click", () => {
   try {
@@ -484,6 +572,14 @@ stopQuestionEl.addEventListener("click", async () => {
     await stopQuestionRecording();
   } catch (error) {
     logger.log(`Question send failed: ${String(error)}`);
+  }
+});
+
+sendManualQuestionEl.addEventListener("click", () => {
+  try {
+    sendManualQuestion();
+  } catch (error) {
+    logger.log(`Text question send failed: ${String(error)}`);
   }
 });
 
@@ -521,12 +617,15 @@ async function toggleFeed(): Promise<void> {
 
 async function startFeed(): Promise<void> {
   startFeedEl.disabled = true;
+  voiceFeedToggleEl.disabled = true;
+  setCameraStatus("Starting camera...");
 
   try {
     activeStream = await startCameraStream(sendTargetFps);
     attachStreamsToPreviews(activeStream);
     await applyViewportCameraConstraints();
     logger.log("Camera stream started");
+    setCameraStatus("Camera started. Connecting feed...");
 
     await webrtc.connect(activeStream);
     activeSessionId = webrtc.getSessionId();
@@ -537,11 +636,15 @@ async function startFeed(): Promise<void> {
 
     await applySendFramerate(sendTargetFps, false);
     await refreshAdminData();
+    setCameraStatus("Feed connected.");
   } catch (error) {
-    logger.log(`Start feed failed: ${String(error)}`);
+    const message = formatErrorMessage(error);
+    logger.log(`Start feed failed: ${message}`);
+    setCameraStatus(`Feed failed: ${message}`);
     await stopFeed(false);
   } finally {
     startFeedEl.disabled = false;
+    voiceFeedToggleEl.disabled = false;
     renderStartButton();
     renderLatestDashboard();
   }
@@ -569,6 +672,7 @@ async function stopFeed(shouldLog: boolean): Promise<void> {
 
   if (shouldLog) {
     logger.log("Feed stopped");
+    setCameraStatus("Feed stopped.");
   }
 
   renderStartButton();
@@ -576,12 +680,14 @@ async function stopFeed(shouldLog: boolean): Promise<void> {
 }
 
 function attachStreamsToPreviews(stream: MediaStream | null): void {
+  prepareInlineVideo(cameraPreviewEl);
+  prepareInlineVideo(voicePreviewEl);
   cameraPreviewEl.srcObject = stream;
   voicePreviewEl.srcObject = stream;
 
   if (stream) {
-    void cameraPreviewEl.play().catch(() => undefined);
-    void voicePreviewEl.play().catch(() => undefined);
+    void playPreviewVideo(cameraPreviewEl);
+    void playPreviewVideo(voicePreviewEl);
   }
 
   if (!stream) {
@@ -590,6 +696,35 @@ function attachStreamsToPreviews(stream: MediaStream | null): void {
 
   updateViewportLayout();
   updateVoicePreviewState();
+}
+
+function prepareInlineVideo(video: HTMLVideoElement): void {
+  video.autoplay = true;
+  video.muted = true;
+  video.defaultMuted = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "");
+}
+
+async function playPreviewVideo(video: HTMLVideoElement): Promise<void> {
+  try {
+    await video.play();
+  } catch (error) {
+    logger.log(`Video preview play blocked: ${formatErrorMessage(error)}`);
+  }
+}
+
+function setCameraStatus(message: string): void {
+  cameraStatusEl.textContent = message;
+}
+
+function formatErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
 
 function setTheme(theme: ThemeName, persist: boolean): void {
@@ -809,137 +944,139 @@ function startQuestionRecording(): void {
   if (!webrtc.isReadyToSend()) {
     throw new Error("Connect before sending a question");
   }
-  if (questionRecorder && questionRecorder.state !== "inactive") {
+  if (questionRecognition) {
     throw new Error("Question recording is already in progress");
   }
-  if (typeof MediaRecorder === "undefined") {
-    throw new Error("MediaRecorder is not available in this browser");
+
+  const Recognition = getSpeechRecognitionConstructor();
+  if (!Recognition) {
+    answerOutputEl.textContent = "Voice recognition is unavailable here. Type your question instead.";
+    throw new Error("Speech recognition is not available in this browser");
   }
 
-  const audioTracks = activeStream.getAudioTracks();
-  if (!audioTracks.length) {
-    throw new Error("The active source does not include a microphone track");
-  }
+  const recognition = new Recognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language || "en-US";
+  questionTranscript = "";
+  discardQuestionTranscript = false;
 
-  questionChunks = [];
-  discardRecordedQuestion = false;
-  const mimeType = pickRecorderMimeType();
-  const recorderStream = new MediaStream(audioTracks);
-  questionRecorder = mimeType
-    ? new MediaRecorder(recorderStream, { mimeType })
-    : new MediaRecorder(recorderStream);
-
-  questionRecorder.ondataavailable = (event) => {
-    if (event.data.size > 0) {
-      questionChunks.push(event.data);
+  recognition.onresult = (event) => {
+    const transcript = collectSpeechTranscript(event.results);
+    questionTranscript = transcript;
+    if (transcript) {
+      answerOutputEl.textContent = transcript;
     }
   };
 
-  questionRecorder.onerror = (event) => {
-    logger.log(`Question recorder error: ${event.error?.message ?? "unknown error"}`);
+  recognition.onerror = (event) => {
+    logger.log(`Speech recognition error: ${event.error ?? event.message ?? "unknown error"}`);
   };
 
-  questionRecorder.onstop = () => {
-    const recorder = questionRecorder;
-    questionRecorder = null;
-    const shouldDiscard = discardRecordedQuestion;
-    discardRecordedQuestion = false;
+  recognition.onend = () => {
+    questionRecognition = null;
+    const transcript = questionTranscript.trim();
+    const shouldDiscard = discardQuestionTranscript;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+
     if (shouldDiscard) {
-      questionChunks = [];
-      return;
-    }
-    if (!recorder || !questionChunks.length) {
-      logger.log("No question audio captured");
-      questionChunks = [];
       return;
     }
 
-    void sendRecordedQuestion(new Blob(questionChunks, { type: recorder.mimeType }));
-    questionChunks = [];
+    if (!transcript) {
+      statusEl.textContent = "idle";
+      answerOutputEl.textContent = "No question heard.";
+      logger.log("No speech transcript captured");
+      return;
+    }
+
+    try {
+      sendQuestionText(transcript);
+    } catch (error) {
+      statusEl.textContent = "idle";
+      answerOutputEl.textContent = "Question send failed.";
+      logger.log(`Question send failed: ${String(error)}`);
+    }
   };
 
-  questionRecorder.start();
-  statusEl.textContent = "recording";
+  questionRecognition = recognition;
+  try {
+    recognition.start();
+  } catch (error) {
+    questionRecognition = null;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+    throw error;
+  }
+  statusEl.textContent = "listening";
   answerOutputEl.textContent = "Listening...";
-  logger.log("Recording question...");
+  logger.log("Listening for question...");
 }
 
 async function stopQuestionRecording(): Promise<void> {
-  if (!questionRecorder || questionRecorder.state === "inactive") {
+  if (!questionRecognition) {
     throw new Error("No active question recording");
   }
 
-    answerOutputEl.textContent = "Processing...";
-
-
-  questionRecorder.stop();
+  statusEl.textContent = "processing";
+  answerOutputEl.textContent = "Processing...";
+  questionRecognition.stop();
 }
 
 function resetQuestionRecorder(): void {
-  if (questionRecorder && questionRecorder.state !== "inactive") {
-    discardRecordedQuestion = true;
-    questionRecorder.stop();
+  if (questionRecognition) {
+    discardQuestionTranscript = true;
+    questionRecognition.abort();
   }
-  questionRecorder = null;
-  questionChunks = [];
+  questionRecognition = null;
+  questionTranscript = "";
 }
 
-function pickRecorderMimeType(): string | undefined {
-  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
-  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate));
+function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null {
+  const speechWindow = window as SpeechRecognitionWindow;
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
-function createUploadId(): string {
-  return `audio-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+function collectSpeechTranscript(results: SpeechRecognitionResultListLike): string {
+  const parts: string[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const alternative = results[index][0];
+    const transcript = alternative?.transcript.trim();
+    if (transcript) {
+      parts.push(transcript);
+    }
+  }
+
+  return parts.join(" ").trim();
 }
 
-async function sendRecordedQuestion(audioBlob: Blob): Promise<void> {
+function sendQuestionText(text: string): void {
   if (!webrtc.isReadyToSend()) {
     throw new Error("Connection closed before the question was sent");
   }
 
-  const arrayBuffer = await audioBlob.arrayBuffer();
-  const bytes = new Uint8Array(arrayBuffer);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+  const normalizedText = text.trim();
+  if (!normalizedText) {
+    throw new Error("No question text captured");
   }
 
-  const audioBase64 = btoa(binary);
-  const totalChunks = Math.max(1, Math.ceil(audioBase64.length / AUDIO_CHUNK_SIZE));
-  const uploadId = createUploadId();
-
-  logger.log(
-    `Sending question audio: ${bytes.length} bytes, ${audioBase64.length} base64 chars, ${totalChunks} chunk(s)`
-  );
   statusEl.textContent = "waiting";
+  answerOutputEl.textContent = "Processing...";
+  webrtc.sendJson({ type: "question_text", text: normalizedText });
+  logger.log(`Question text sent: ${normalizedText}`);
+}
 
-  if (totalChunks === 1) {
-    webrtc.sendJson({
-      type: "question_audio",
-      audio_base64: audioBase64,
-      audio_mime_type: audioBlob.type || "application/octet-stream"
-    });
-    logger.log("Question audio sent");
-    return;
+function sendManualQuestion(): void {
+  if (!activeStream) {
+    throw new Error("Start a source before sending a question");
+  }
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Connect before sending a question");
   }
 
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-    const start = chunkIndex * AUDIO_CHUNK_SIZE;
-    const end = start + AUDIO_CHUNK_SIZE;
-    const chunkData = audioBase64.slice(start, end);
-
-    webrtc.sendJson({
-      type: "question_audio_chunk",
-      upload_id: uploadId,
-      chunk_index: chunkIndex,
-      total_chunks: totalChunks,
-      chunk_data: chunkData,
-      audio_mime_type: audioBlob.type || "application/octet-stream"
-    });
-  }
-
-  logger.log("Question audio sent");
+  sendQuestionText(manualQuestionTextEl.value);
+  manualQuestionTextEl.value = "";
 }
 
 async function fetchDebugSessions(): Promise<DebugSession[]> {

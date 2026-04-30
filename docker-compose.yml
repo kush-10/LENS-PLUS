@@ -6,7 +6,7 @@ services:
       - "8000:8000"     
     environment:
       - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
-      - VOSK_MODEL_PATH=${VOSK_MODEL_PATH:-/app/models/vosk-model}
+      - RTC_ICE_SERVERS=${RTC_ICE_SERVERS:-stun:stun.l.google.com:19302}
       - SMOLVLM_MODEL_ID=${SMOLVLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
       - SMOLVLM_MAX_NEW_TOKENS=${SMOLVLM_MAX_NEW_TOKENS:-120}
       - SMOLVLM_NUM_BEAMS=${SMOLVLM_NUM_BEAMS:-1}
@@ -27,6 +27,7 @@ services:
       - "5173:5173"
     environment:
       - VITE_SIGNALING_BASE_URL=${VITE_SIGNALING_BASE_URL:-/api}
+      - VITE_RTC_ICE_SERVERS=${VITE_RTC_ICE_SERVERS:-stun:stun.l.google.com:19302}
       - VITE_API_PROXY_TARGET=${VITE_API_PROXY_TARGET:-http://api:8000}
       - DEV_HTTPS=${DEV_HTTPS:-false}
       - DEV_HTTPS_KEY_FILE=${DEV_HTTPS_KEY_FILE:-/app/certs/dev-key.pem}
