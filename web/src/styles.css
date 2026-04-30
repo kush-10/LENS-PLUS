@@ -144,90 +144,6 @@ textarea {
   gap: 0.6rem;
 }
 
-.button-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-}
-
-.manual-question {
-  display: grid;
-  gap: 0.45rem;
-}
-
-.manual-question label {
-  color: var(--text-muted);
-  font-size: 0.84rem;
-}
-
-.manual-question textarea {
-  width: 100%;
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  background: var(--surface-3);
-  color: var(--text-primary);
-  padding: 0.65rem 0.7rem;
-  resize: vertical;
-}
-
-.panel-copy {
-  color: var(--text-muted);
-}
-
-.voice-panel {
-  align-content: start;
-}
-
-.voice-preview-stage {
-  min-height: 240px;
-}
-
-#voice-preview {
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  display: block;
-  object-fit: contain;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface-3);
-}
-
-.voice-preview-placeholder {
-  min-height: 240px;
-  border: 1px dashed var(--border-strong);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, var(--surface-2), var(--surface-3));
-  color: var(--text-muted);
-  display: grid;
-  align-content: center;
-  justify-items: start;
-  gap: 0.45rem;
-  padding: 1rem 1.1rem;
-  text-align: left;
-}
-
-.voice-preview-placeholder strong {
-  color: var(--text-primary);
-  font-size: 0.9rem;
-}
-
-.voice-preview-placeholder span {
-  max-width: 32rem;
-  line-height: 1.45;
-}
-
-.answer-output {
-  min-height: 5.5rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2);
-  padding: 0.85rem;
-  line-height: 1.5;
-  color: var(--text-primary);
-  white-space: pre-wrap;
-}
-
 .page-top {
   display: flex;
 }
@@ -269,6 +185,81 @@ textarea {
   color: var(--text-muted);
   font-size: 0.84rem;
   line-height: 1.4;
+}
+
+.camera-record-box {
+  width: 100%;
+  min-height: 72px;
+  border-radius: 12px;
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--text-primary);
+  display: grid;
+  place-items: center;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.camera-record-box:hover {
+  background: var(--surface-2);
+}
+
+.camera-record-box.is-recording {
+  border-color: var(--tone-warn-border);
+  background: var(--tone-warn-bg);
+  color: var(--tone-warn-fg);
+}
+
+.camera-question-panel {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.85rem;
+}
+
+.camera-question-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.84rem;
+}
+
+.camera-question-status strong {
+  color: var(--text-primary);
+  font-size: 0.88rem;
+  text-transform: lowercase;
+}
+
+.camera-question-block {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.camera-question-block span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.camera-question-text {
+  min-height: 3.25rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  line-height: 1.45;
+  padding: 0.7rem;
+  white-space: pre-wrap;
+}
+
+.camera-question-text.is-muted {
+  color: var(--text-muted);
 }
 
 #camera-preview {
