@@ -12,9 +12,10 @@ It is intentionally lightweight so you can swap in a real model pipeline with mi
 - Returns persisted session dump history (`GET /debug/sessions/history`)
 - Exposes latest JPEG snapshot per session (`GET /debug/sessions/{session_id}/latest.jpg`)
 - Writes all processed session frames to disk (`api/app/session_artifacts/` by default)
+- Reads model sidecars written beside those frames by the Docker `model-pipeline` service
 - Receives directional telemetry on data channel `results` using `client_sensor`
 - Receives voice-question transcripts using `question_text`
-- Builds answer context from grouped frame metadata plus `.detections.json` and `.navigation.json` sidecars
+- Builds answer context by summarizing frame metadata plus `.detections.json` and `.navigation.json` sidecars since the previous answer
 - Uses SmolVLM, local Ollama/Qwen, and local TTS for answer text and optional MP3 audio
 
 Core implementation is in `api/app/main.py`.
@@ -48,10 +49,12 @@ http://localhost:8000/health
   - Enables legacy mock inference ticks on the data channel for scaffold testing.
 - `OLLAMA_BASE_URL` (default for Docker: `http://host.docker.internal:11434`)
   - Base URL for Ollama running on the host machine.
-- `OLLAMA_MODEL` (default: `qwen2.5`)
+- `OLLAMA_MODEL` (default: `qwen2.5:7b-instruct`)
   - Local Ollama model used for final answer composition.
 - `OLLAMA_TIMEOUT_SECONDS` and `OLLAMA_NUM_PREDICT`
   - Ollama request timeout and response length controls.
+- `ENABLE_LLM_PROMPT_AUDIT` (default: `true`)
+  - Writes full raw Ollama/Qwen prompt and answer audits under each session artifact in `question-audits/`.
 - `SMOLVLM_MODEL_ID` (default: `HuggingFaceTB/SmolVLM-256M-Instruct`)
   - Hugging Face model id for local visual-language analysis.
 - `SMOLVLM_MAX_NEW_TOKENS` and `SMOLVLM_NUM_BEAMS`
@@ -334,17 +337,21 @@ The final answer includes text and, when local TTS succeeds, MP3 audio as base64
 
 If SmolVLM sidecars, the LLM, or TTS fail, the backend still returns the best available text answer and includes `audio_error` when only speech generation fails.
 
-## Linking this to a real model
+## Linking this to the model pipeline
 
-The simplest integration is to replace `send_mock_results()` with model-backed inference results.
+Docker Compose starts a separate `model-pipeline` service that runs `models/start_pipeline.py --no-video`. The API and model service share `api/app/session_artifacts/`.
 
-Recommended approach:
+The integration flow is:
 
-1. Keep frame sampling where it is (already rate-limited by `ANALYSIS_TARGET_FPS`).
-2. Convert sampled frame to model input (`numpy`, PIL, tensor, etc.).
-3. Run inference off the event loop (thread pool or worker process for heavy models).
-4. Map predictions to the frontend message shape.
-5. Send serialized JSON over `session.data_channel`.
+1. The API samples WebRTC frames and writes grouped `frame-*.jpg` artifacts.
+2. The model pipeline watches completed groups and writes sidecars next to those frames.
+3. Object detection writes `frame-*.detections.json`.
+4. Segmentation and depth write `frame-*.navigation.json`.
+5. On `question_text`, the API builds summarized scene context from all artifact frames since the previous answer, queries SmolVLM with the latest frame, sends both to Ollama/Qwen, then returns text and TTS audio over the data channel.
+
+The old `send_mock_results()` path remains available only when `ENABLE_MOCK_RESULTS=true`.
+
+If you later want live detection overlays in the browser, map model predictions to the frontend message shape and send serialized JSON over `session.data_channel`.
 
 Expected message shape (consumed by web client):
 

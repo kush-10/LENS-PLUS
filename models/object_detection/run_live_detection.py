@@ -24,6 +24,13 @@ OUTPUT_HEIGHT = 360
 
 DEMO_BATCH_SIZE = 2
 
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2))
+    temporary_path.replace(path)
+
 def natural_key(path: Path) -> list:
     return [
         int(t) if t.isdigit() else t.lower()
@@ -228,12 +235,12 @@ class ObjectDetector:
                     }
 
                     sidecar = frame_path.with_suffix(".detections.json")
-                    sidecar.write_text(json.dumps({
+                    write_json_atomic(sidecar, {
                         "frame": frame_path.name,
                         "timestamp": frame_path.stem.split("-")[-1],
                         "detections": detections,
                         "metrics": frame_metrics,
-                    }, indent=2))
+                    })
 
                     if out is not None:
                         annotated = results[0].plot()
@@ -350,7 +357,7 @@ class ObjectDetector:
                     results = self.process_group(frame_paths, video_path)
                     results["group"]    = group.name
                     results["artifact"] = artifact.name
-                    json_path.write_text(json.dumps(results, indent=2) + "\n")
+                    write_json_atomic(json_path, results)
                     print(f"  JSON: {json_path.name}")
 
                     processed_groups.add(key)
@@ -413,5 +420,3 @@ if __name__ == "__main__":
         write_video=not args.no_video,
     )
     detector.run()
-
-

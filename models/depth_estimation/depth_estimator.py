@@ -4,6 +4,7 @@ import time
 import os
 import sys
 import argparse
+import fcntl
 
 os.environ["XFORMERS_DISABLED"] = "1"
 sys.modules["xformers"] = None
@@ -35,6 +36,30 @@ OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
 
 DEMO_BATCH_SIZE = 2 # merge groups of frames every n groups
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2))
+    temporary_path.replace(path)
+
+
+def merge_navigation_sidecar(path: Path, updates: dict) -> None:
+    lock_path = Path(f"{path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+
+        existing.update(updates)
+        write_json_atomic(path, existing)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 def read_and_resize(path: Path) -> np.ndarray | None:
     frame = cv2.imread(str(path))
@@ -262,34 +287,28 @@ class DepthEstimator:
         latency_ms: float,
     ):
         sidecar = frame_path.with_suffix(".navigation.json")
-        try:
-            existing = json.loads(sidecar.read_text()) if sidecar.exists() else {}
-        except Exception:
-            existing = {}
-
-        existing["frame"] = frame_path.name
-        existing["timestamp"] = frame_path.stem.split("-")[-1]
-
-        existing["depth"] = {
-            "proximity_status":     analysis["proximity_status"],
-            "proximity_detail":     analysis["proximity_detail"],
-            "primary_hazard_m":     analysis["primary_hazard_m"],
-            "direction_warning":    analysis["direction_warning"],
-            "dominant_zone":        analysis["dominant_zone"],
-            "zone_nearest_m":       analysis["zone_nearest_m"],
-            "zone_mean_m":          analysis["zone_mean_m"],
-            "nearest_m":            analysis["nearest_m"],
-            "objects":              per_object,
-            "temporal_consistency": round(consistency, 4),
-            "depth_variance":       variance,
-            "depth_edge_density":   edge_density,
-            "valid_pixel_ratio":    valid_ratio,
-            "status_changed":       status_changed,
-            "zone_stability_m":     zone_stability,
-            "inference_latency_ms": round(latency_ms, 2),
-        }
-
-        sidecar.write_text(json.dumps(existing, indent=2))
+        merge_navigation_sidecar(sidecar, {
+            "frame": frame_path.name,
+            "timestamp": frame_path.stem.split("-")[-1],
+            "depth": {
+                "proximity_status":     analysis["proximity_status"],
+                "proximity_detail":     analysis["proximity_detail"],
+                "primary_hazard_m":     analysis["primary_hazard_m"],
+                "direction_warning":    analysis["direction_warning"],
+                "dominant_zone":        analysis["dominant_zone"],
+                "zone_nearest_m":       analysis["zone_nearest_m"],
+                "zone_mean_m":          analysis["zone_mean_m"],
+                "nearest_m":            analysis["nearest_m"],
+                "objects":              per_object,
+                "temporal_consistency": round(consistency, 4),
+                "depth_variance":       variance,
+                "depth_edge_density":   edge_density,
+                "valid_pixel_ratio":    valid_ratio,
+                "status_changed":       status_changed,
+                "zone_stability_m":     zone_stability,
+                "inference_latency_ms": round(latency_ms, 2),
+            },
+        })
 
     def infer_real_fps(self, frame_paths: list[Path]) -> int:
         if len(frame_paths) < 2:
@@ -687,4 +706,3 @@ if __name__ == "__main__":
         write_video=not args.no_video,
     )
     model.run()
-

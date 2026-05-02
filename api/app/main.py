@@ -23,7 +23,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
-from .llm import OllamaCompletionError, generate_assistant_answer
+from .llm import (
+    OllamaCompletionError,
+    generate_assistant_answer,
+    prompt_audit_enabled,
+    update_prompt_audit,
+)
 from .scene_context import build_scene_context
 from .tts import AudioProcessingError, text_to_speech_bytes
 from .vlm import VisionModelError, query_image_model
@@ -147,6 +152,7 @@ class Session:
     latest_inference_payload: dict[str, Any] | None = None
     latest_inference_at: datetime | None = None
     latest_processed_detections: dict[str, Any] | None = None
+    last_answered_frame_index: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -261,6 +267,7 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                     else None
                 ),
                 "latest_processed_detections": session.latest_processed_detections,
+                "last_answered_frame_index": session.last_answered_frame_index,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
@@ -646,6 +653,31 @@ def start_question_task(session: Session, text: str) -> None:
     task.add_done_callback(clear_finished_task)
 
 
+def create_prompt_audit_path(session: Session) -> Path | None:
+    if not prompt_audit_enabled() or session.artifact_dir is None:
+        return None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        session.artifact_dir
+        / "question-audits"
+        / f"question-{timestamp}-{uuid.uuid4().hex[:8]}.json"
+    )
+
+
+def safe_update_prompt_audit(
+    prompt_audit_path: Path | None,
+    updates: dict[str, Any],
+) -> None:
+    if prompt_audit_path is None:
+        return
+
+    try:
+        update_prompt_audit(prompt_audit_path, updates)
+    except Exception as error:
+        logger.warning("Prompt audit write failed: %s", error)
+
+
 async def run_question_pipeline(session: Session, text: str) -> None:
     logger.info(
         "Assistant pipeline started transcript_len=%d has_frame=%s artifact_id=%s",
@@ -661,15 +693,45 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         return
 
     image_bytes = session.latest_jpeg
+    image_source = "latest_session_jpeg"
+    question_max_frame_index = session.processed_frames
     scene_context = build_scene_context(
         artifact_dir=session.artifact_dir,
         latest_jpeg_at=session.latest_jpeg_at,
         latest_frame_at=session.last_frame_at,
         latest_directional_context=session.latest_processed_directional,
         latest_detection_context=session.latest_processed_detections,
+        after_frame_index=session.last_answered_frame_index,
+        max_frame_index=question_max_frame_index,
+    )
+    scene_context["frame"]["vlm_image_source"] = image_source
+    prompt_audit_path = create_prompt_audit_path(session)
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "type": "llm_prompt_audit",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "session": {
+                "artifact_id": session.artifact_id,
+                "artifact_dir": str(session.artifact_dir) if session.artifact_dir else None,
+            },
+            "question": {
+                "text": text,
+                "chars": len(text),
+            },
+            "frame_window": scene_context.get("frame_window"),
+            "vlm_image_source": image_source,
+            "scene_context": scene_context,
+        },
     )
     missing_context = scene_context.get("missing_context")
-    logger.info("Scene context loaded missing_context=%s", missing_context)
+    logger.info(
+        "Scene context loaded missing_context=%s frame_window=%s image_source=%s audit_path=%s",
+        missing_context,
+        scene_context.get("frame_window"),
+        image_source,
+        str(prompt_audit_path) if prompt_audit_path else None,
+    )
     vlm_text: str | None = None
 
     await send_status(session, "running_vlm", "Inspecting the latest camera frame.")
@@ -677,9 +739,30 @@ async def run_question_pipeline(session: Session, text: str) -> None:
     try:
         vlm_text = await query_image_model(image_bytes, text)
         logger.info("VLM stage completed vlm_chars=%d", len(vlm_text))
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "text": vlm_text,
+                    "text_chars": len(vlm_text),
+                }
+            },
+        )
     except VisionModelError as error:
         scene_context["warnings"].append(f"VLM unavailable: {error}")
         logger.warning("VLM stage unavailable: %s", error)
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "error": str(error),
+                }
+            },
+        )
         await send_status(
             session,
             "running_llm",
@@ -688,6 +771,16 @@ async def run_question_pipeline(session: Session, text: str) -> None:
     except Exception as error:
         scene_context["warnings"].append(f"VLM failed: {error}")
         logger.warning("VLM stage failed: %s", error)
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "error": str(error),
+                }
+            },
+        )
         await send_status(
             session,
             "running_llm",
@@ -698,23 +791,28 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         await send_status(session, "running_llm", "Composing a navigation answer.")
 
     logger.info("Running Ollama/Qwen answer stage")
+    answer_source = "ollama"
     try:
         answer = await generate_assistant_answer(
             question=text,
             scene_context=scene_context,
             vlm_text=vlm_text,
+            prompt_audit_path=prompt_audit_path,
         )
         logger.info("Ollama/Qwen answer stage completed answer_chars=%d", len(answer))
     except OllamaCompletionError as error:
         scene_context["warnings"].append(f"Ollama unavailable: {error}")
         logger.warning("Ollama/Qwen answer stage unavailable: %s", error)
+        answer_source = "fallback"
         answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
     except Exception as error:
         scene_context["warnings"].append(f"Ollama failed: {error}")
         logger.warning("Ollama/Qwen answer stage failed: %s", error)
+        answer_source = "fallback"
         answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
 
     if not answer.strip():
+        answer_source = "fallback"
         answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
 
     await send_status(session, "generating_speech", "Generating speech.")
@@ -738,6 +836,24 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         answer=answer,
         audio_base64=audio_base64,
         audio_error=audio_error,
+    )
+    session.last_answered_frame_index = max(
+        session.last_answered_frame_index,
+        question_max_frame_index,
+    )
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "pipeline_result": {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "answer_source": answer_source,
+                "answer": answer,
+                "answer_chars": len(answer),
+                "last_answered_frame_index": session.last_answered_frame_index,
+                "audio_generated": audio_base64 is not None,
+                "audio_error": audio_error,
+            }
+        },
     )
     logger.info(
         "Assistant pipeline completed answer_chars=%d audio=%s",
@@ -1410,6 +1526,7 @@ def build_session_manifest(
             else None
         ),
         "latest_processed_detections": session.latest_processed_detections,
+        "last_answered_frame_index": session.last_answered_frame_index,
         "latest_jpeg_at": (
             session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
         ),

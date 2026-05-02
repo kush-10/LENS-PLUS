@@ -23,13 +23,17 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
   - `GET /debug/sessions/{session_id}/latest.jpg`
   - Per-session frame dump artifacts in `api/app/session_artifacts/`
   - Typed data-channel messages for directional sensor telemetry and `question_text`
-  - Assistant pipeline: latest frame + sidecar context + SmolVLM + local Ollama/Qwen + local TTS
+  - Assistant pipeline: summarized frame-window context + SmolVLM + local Ollama/Qwen + local TTS
+- `model-pipeline` (Docker Compose service)
+  - Runs `models/start_pipeline.py --no-video`
+  - Watches API frame artifacts and writes object detection, segmentation, and depth sidecars for assistant context
 
 ## Repository layout
 
 - `web/` frontend app
 - `api/` backend signaling service
 - `api/README.md` backend details + model integration guide
+- `Dockerfile.models` model pipeline Docker image
 - `scripts/setup-dev-https.sh` local HTTPS helper for phone camera testing
 - `docker-compose.yml` shared dev setup
 
@@ -42,7 +46,7 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
 
 ## Model Files Setup
 
-Before running the backend, you need to download the required model files:
+The Docker model pipeline downloads the required checkpoint archive from the Dropbox link below during image build when the files are not already present locally.
 
 1. **Download models from Dropbox:**
    
@@ -54,8 +58,10 @@ Before running the backend, you need to download the required model files:
      - Place in: `models/segmentation/src/`
    
    - `depth_anything_v2_metric_hypersim_vits.pth`
-     - Place in: `models/depth_estimation/checkpoints/`
-     - **Note:** Create the `checkpoints/` directory if it doesn't exist
+      - Place in: `models/depth_estimation/checkpoints/`
+      - **Note:** Create the `checkpoints/` directory if it doesn't exist
+
+If those files already exist locally, they are copied into the `model-pipeline` image and the archive download is skipped. The Docker model image also installs the public DeepLabV3Plus-Pytorch code dependency during build if `models/segmentation/src/DeepLabV3Plus-Pytorch/network` is not already present.
 
 ```bash
    # Example: Creating the checkpoints directory
@@ -84,9 +90,10 @@ SNAPSHOT_JPEG_QUALITY=92
 ANALYSIS_TARGET_FPS=15
 ENABLE_MOCK_RESULTS=false
 OLLAMA_BASE_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=qwen2.5
+OLLAMA_MODEL=qwen2.5:7b-instruct
 OLLAMA_TIMEOUT_SECONDS=60
 OLLAMA_NUM_PREDICT=180
+ENABLE_LLM_PROMPT_AUDIT=true
 SMOLVLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
 SMOLVLM_MAX_NEW_TOKENS=120
 SMOLVLM_NUM_BEAMS=1
@@ -96,7 +103,9 @@ SMOLVLM_NUM_BEAMS=1
 
 These defaults target Docker Compose. For a fully local no-Docker run, use `VITE_SIGNALING_BASE_URL=http://localhost:8000` and point `VITE_API_PROXY_TARGET` at `http://localhost:8000` if you keep the `/api` proxy path.
 
-`OLLAMA_BASE_URL` points the API container at Ollama running on the host machine. With Docker Compose, `http://host.docker.internal:11434` is the expected value. Ensure the configured `OLLAMA_MODEL` is pulled locally, for example `ollama pull qwen2.5`.
+`OLLAMA_BASE_URL` points the API container at Ollama running on the host machine. With Docker Compose, `http://host.docker.internal:11434` is the expected value. Ensure the configured `OLLAMA_MODEL` is pulled locally, for example `ollama pull qwen2.5:7b-instruct`.
+
+`ENABLE_LLM_PROMPT_AUDIT=true` writes the full raw Ollama/Qwen prompt and answer audit under each session artifact in `question-audits/`.
 
 Local TTS uses macOS `say` or Linux `espeak-ng`, then encodes MP3 with `ffmpeg`. The API Docker image installs `espeak-ng` and `ffmpeg`.
 
@@ -121,6 +130,12 @@ For better detection quality from backend snapshots, keep:
 ```bash
 docker compose up --build
 ```
+
+This starts three services:
+
+- `api`: receives WebRTC video, writes grouped frame artifacts, runs VLM/LLM/TTS for questions
+- `model-pipeline`: runs `models/start_pipeline.py --no-video` and writes `.detections.json` / `.navigation.json` sidecars into the shared artifacts directory
+- `web`: serves the camera UI
 
 2. Open web app:
 

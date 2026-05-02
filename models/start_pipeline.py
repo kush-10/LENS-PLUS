@@ -24,6 +24,11 @@ def main():
         action="store_true",
         help="Skip mp4 writing in all scripts",
     )
+    parser.add_argument(
+        "--exit-on-child-failure",
+        action="store_true",
+        help="Stop the pipeline if any child model process exits",
+    )
     args = parser.parse_args()
 
     extra_args = ["--no-video"] if args.no_video else []
@@ -57,6 +62,8 @@ def main():
                 if process.poll() is None:
                     continue
                 code = process.returncode
+                if args.exit_on_child_failure:
+                    raise RuntimeError(f"{name} stopped unexpectedly (exit {code})")
                 print(f"WARN: {name} stopped unexpectedly (exit {code}). Restarting...")
                 script_path, script_args = process_specs[name]
                 processes[name] = launch_process(script_path, script_args)
@@ -69,6 +76,15 @@ def main():
         for process in processes.values():
             process.wait()
         print("Shutdown complete.")
+    except RuntimeError as error:
+        print(f"Pipeline failed: {error}")
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+
+        for process in processes.values():
+            process.wait()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
