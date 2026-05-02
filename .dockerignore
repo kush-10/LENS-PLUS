@@ -1,0 +1,11 @@
+.git
+.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+api/.venv/
+api/app/session_artifacts/
+models/**/output/
+web/node_modules/
+web/dist/
