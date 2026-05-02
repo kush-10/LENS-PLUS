@@ -1,6 +1,6 @@
 # LENS+ Python API
 
-This service handles WebRTC signaling, receives camera frames, throttles analysis to a fixed FPS, and sends inference-style messages over a WebRTC data channel.
+This service handles WebRTC signaling, receives camera frames, throttles analysis to a fixed FPS, stores grouped artifacts, and answers voice-question transcripts over a WebRTC data channel.
 
 It is intentionally lightweight so you can swap in a real model pipeline with minimal changes.
 
@@ -12,7 +12,10 @@ It is intentionally lightweight so you can swap in a real model pipeline with mi
 - Returns persisted session dump history (`GET /debug/sessions/history`)
 - Exposes latest JPEG snapshot per session (`GET /debug/sessions/{session_id}/latest.jpg`)
 - Writes all processed session frames to disk (`api/app/session_artifacts/` by default)
-- Sends mock inference payloads on data channel `results` (replace this with your model output)
+- Receives directional telemetry on data channel `results` using `client_sensor`
+- Receives voice-question transcripts using `question_text`
+- Builds answer context from grouped frame metadata plus `.detections.json` and `.navigation.json` sidecars
+- Uses SmolVLM, local Ollama/Qwen, and local TTS for answer text and optional MP3 audio
 
 Core implementation is in `api/app/main.py`.
 
@@ -41,12 +44,26 @@ http://localhost:8000/health
 - `SESSION_ARTIFACTS_DIR` (optional)
   - Directory where per-session frame dumps are written.
   - Defaults to `api/app/session_artifacts` in local runs and `/app/app/session_artifacts` in Docker.
+- `ENABLE_MOCK_RESULTS` (default: `false`)
+  - Enables legacy mock inference ticks on the data channel for scaffold testing.
+- `OLLAMA_BASE_URL` (default for Docker: `http://host.docker.internal:11434`)
+  - Base URL for Ollama running on the host machine.
+- `OLLAMA_MODEL` (default: `qwen2.5`)
+  - Local Ollama model used for final answer composition.
+- `OLLAMA_TIMEOUT_SECONDS` and `OLLAMA_NUM_PREDICT`
+  - Ollama request timeout and response length controls.
+- `SMOLVLM_MODEL_ID` (default: `HuggingFaceTB/SmolVLM-256M-Instruct`)
+  - Hugging Face model id for local visual-language analysis.
+- `SMOLVLM_MAX_NEW_TOKENS` and `SMOLVLM_NUM_BEAMS`
+  - SmolVLM generation controls.
 
 Examples:
 
 ```bash
 ANALYSIS_TARGET_FPS=15 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+Local TTS requires macOS `say` or Linux `espeak-ng`, plus `ffmpeg` for MP3 encoding. The API Dockerfile installs `espeak-ng` and `ffmpeg`.
 
 With Docker Compose (root `docker-compose.yml`), this value is passed into the `api` container via:
 
@@ -282,6 +299,40 @@ To clear artifacts:
 ```
 
 This gives you backpressure control before a real model is attached.
+
+## Voice Assistant Data Channel
+
+The frontend sends a text transcript after browser SpeechRecognition stops:
+
+```json
+{
+  "type": "question_text",
+  "text": "What is in front of me?"
+}
+```
+
+The backend sends status events while the pipeline runs:
+
+```json
+{
+  "type": "status",
+  "status": "running_llm",
+  "message": "Composing a navigation answer."
+}
+```
+
+The final answer includes text and, when local TTS succeeds, MP3 audio as base64:
+
+```json
+{
+  "type": "answer",
+  "transcript": "What is in front of me?",
+  "answer": "There is a chair ahead; move slightly left if you need to pass.",
+  "audio_base64": "..."
+}
+```
+
+If SmolVLM sidecars, the LLM, or TTS fail, the backend still returns the best available text answer and includes `audio_error` when only speech generation fails.
 
 ## Linking this to a real model
 

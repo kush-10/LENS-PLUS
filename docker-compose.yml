@@ -8,6 +8,16 @@ services:
       - SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-0.05}
       - SNAPSHOT_JPEG_QUALITY=${SNAPSHOT_JPEG_QUALITY:-92}
       - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
+      - ENABLE_MOCK_RESULTS=${ENABLE_MOCK_RESULTS:-false}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5}
+      - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-60}
+      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-180}
+      - SMOLVLM_MODEL_ID=${SMOLVLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
+      - SMOLVLM_MAX_NEW_TOKENS=${SMOLVLM_MAX_NEW_TOKENS:-120}
+      - SMOLVLM_NUM_BEAMS=${SMOLVLM_NUM_BEAMS:-1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./api/app:/app/app
     healthcheck:

@@ -4,7 +4,7 @@ Local Environmental Navigation Support +
 
 LENS-PLUS is a navigational system for visually impaired users that aims to improve perception of diverse environments with technology such as object detection, semantic segmentation, depth estimation natural language scene generation and live streaming.
 
-A WebRTC prototype streams video from a phone or desktop browser to a FastAPI backend. The backend returns mock guidance events over a WebRTC data channel and exposes debug endpoints to verify frame intake.
+A WebRTC prototype streams video from a phone or desktop browser to a FastAPI backend. The backend stores grouped frame artifacts, accepts voice-question transcripts over the WebRTC data channel, and can answer with scene context, SmolVLM visual text, local Ollama/Qwen, and local TTS audio.
 
 ## What is implemented
 
@@ -12,7 +12,7 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
   - Camera source (`getUserMedia`) for phone testing
   - Video file source for desktop dev testing
   - WebRTC connect/disconnect flow
-  - Data-channel event log and optional TTS
+  - Directional telemetry UI, voice-question recording, answer text, and audio playback
   - Overlay canvas scaffold for detection boxes
 - `api/` (FastAPI + aiortc)
   - `POST /webrtc/offer`
@@ -22,7 +22,8 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
   - `GET /debug/sessions/history`
   - `GET /debug/sessions/{session_id}/latest.jpg`
   - Per-session frame dump artifacts in `api/app/session_artifacts/`
-  - Mock inference events streamed over WebRTC data channel `results`
+  - Typed data-channel messages for directional sensor telemetry and `question_text`
+  - Assistant pipeline: latest frame + sidecar context + SmolVLM + local Ollama/Qwen + local TTS
 
 ## Repository layout
 
@@ -72,18 +73,39 @@ cp .env.example .env
 Default `.env.example`:
 
 ```bash
-VITE_SIGNALING_BASE_URL=http://localhost:8000
+VITE_SIGNALING_BASE_URL=/api
+VITE_API_PROXY_TARGET=http://api:8000
+DEV_HTTPS=false
+DEV_HTTPS_KEY_FILE=/app/certs/dev-key.pem
+DEV_HTTPS_CERT_FILE=/app/certs/dev-cert.pem
+
 SNAPSHOT_INTERVAL_SECONDS=0.05
 SNAPSHOT_JPEG_QUALITY=92
 ANALYSIS_TARGET_FPS=15
+ENABLE_MOCK_RESULTS=false
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=qwen2.5
+OLLAMA_TIMEOUT_SECONDS=60
+OLLAMA_NUM_PREDICT=180
+SMOLVLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
+SMOLVLM_MAX_NEW_TOKENS=120
+SMOLVLM_NUM_BEAMS=1
 ```
 
 `ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
+
+These defaults target Docker Compose. For a fully local no-Docker run, use `VITE_SIGNALING_BASE_URL=http://localhost:8000` and point `VITE_API_PROXY_TARGET` at `http://localhost:8000` if you keep the `/api` proxy path.
+
+`OLLAMA_BASE_URL` points the API container at Ollama running on the host machine. With Docker Compose, `http://host.docker.internal:11434` is the expected value. Ensure the configured `OLLAMA_MODEL` is pulled locally, for example `ollama pull qwen2.5`.
+
+Local TTS uses macOS `say` or Linux `espeak-ng`, then encodes MP3 with `ffmpeg`. The API Docker image installs `espeak-ng` and `ffmpeg`.
 
 Optional backend env var:
 
 - `SESSION_ARTIFACTS_DIR` (default: `api/app/session_artifacts` in local dev and `/app/app/session_artifacts` in Docker)
   - Directory where per-session processed frame dumps and manifest files are written.
+- `ENABLE_MOCK_RESULTS` (default: `false`)
+  - Enables the old mock inference ticks for scaffold testing.
 
 For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PROXY_TARGET=http://api:8000` (the helper script below configures this automatically).
 
@@ -262,7 +284,7 @@ Refresh to view updated snapshots from the incoming stream.
 https://<your-dev-machine-ip>:5173/api/debug/sessions/history
 ```
 
-Each session artifact stores all processed frames (`frame-*.jpg`) plus `session.json` metadata.
+Each session artifact stores grouped processed frames (`group-*/frame-*.jpg`), frame metadata JSON, optional model sidecars, and `session.json` metadata.
 The artifact path is ignored by git and excluded from API Docker build context.
 
 ## Clear session frame artifacts

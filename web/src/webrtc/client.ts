@@ -134,6 +134,10 @@ export class WebRtcClient {
     }
   }
 
+  isReadyToSend(): boolean {
+    return this.dataChannel?.readyState === "open";
+  }
+
   sendJson(payload: unknown): boolean {
     const channel = this.dataChannel;
     if (!channel || channel.readyState !== "open") {

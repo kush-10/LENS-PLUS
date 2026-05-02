@@ -11,6 +11,49 @@ type ThemeName = "dark" | "light";
 type StatusTone = "up" | "warn" | "down" | "neutral";
 type SensorPermissionState = "unknown" | "granted" | "denied" | "unsupported";
 
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultLike = {
+  readonly isFinal: boolean;
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionAlternativeLike;
+};
+
+type SpeechRecognitionResultListLike = {
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionResultLike;
+};
+
+type SpeechRecognitionEventLike = Event & {
+  readonly results: SpeechRecognitionResultListLike;
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  readonly error?: string;
+  readonly message?: string;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
+
 type RotationRateDps = {
   alpha: number | null;
   beta: number | null;
@@ -284,7 +327,7 @@ app.innerHTML = `
       </div>
     </section>
 
-    <section id="camera-page" class="page hidden">
+    <section id="camera-page" class="page camera-page hidden">
       <div class="page-top">
         <button id="camera-home" class="ghost">Home</button>
       </div>
@@ -317,7 +360,25 @@ app.innerHTML = `
           </div>
         </div>
       </section>
-      <button id="start-feed" class="primary">Start Feed</button>
+      <p id="camera-status" class="camera-status">Camera idle.</p>
+      <div class="camera-actions">
+        <button id="start-feed" class="primary">Start Feed</button>
+        <button id="camera-record-question" class="camera-record-box" type="button">Record Question</button>
+      </div>
+      <section class="camera-question-panel" aria-live="polite">
+        <div class="camera-question-status">
+          <span>Status</span>
+          <strong id="question-status">idle</strong>
+        </div>
+        <div class="camera-question-block">
+          <span>Speech to text</span>
+          <p id="question-transcript" class="camera-question-text is-muted">Record a question to see the transcript here.</p>
+        </div>
+        <div class="camera-question-block">
+          <span>Assistant response</span>
+          <p id="answer-output" class="camera-question-text">No answer yet.</p>
+        </div>
+      </section>
     </section>
 
     <section id="admin-page" class="page hidden">
@@ -431,7 +492,9 @@ const goAdminEl = mustQuery<HTMLButtonElement>("#go-admin");
 const cameraHomeEl = mustQuery<HTMLButtonElement>("#camera-home");
 const adminHomeEl = mustQuery<HTMLButtonElement>("#admin-home");
 const startFeedEl = mustQuery<HTMLButtonElement>("#start-feed");
+const cameraRecordQuestionEl = mustQuery<HTMLButtonElement>("#camera-record-question");
 const cameraPreviewEl = mustQuery<HTMLVideoElement>("#camera-preview");
+const cameraStatusEl = mustQuery<HTMLElement>("#camera-status");
 const directionResetEl = mustQuery<HTMLButtonElement>("#direction-reset");
 const directionNeedleEl = mustQuery<HTMLElement>("#direction-needle");
 const directionRelativeValueEl = mustQuery<HTMLElement>("#direction-relative-value");
@@ -458,12 +521,20 @@ const statusDirectionalAgeEl = mustQuery<HTMLElement>("#status-directional-age")
 const statusDirectionalSamplesEl = mustQuery<HTMLElement>("#status-directional-samples");
 const statusDirectionalErrorsEl = mustQuery<HTMLElement>("#status-directional-errors");
 const statusDirectionalIgnoredEl = mustQuery<HTMLElement>("#status-directional-ignored");
+const questionStatusEl = mustQuery<HTMLElement>("#question-status");
+const questionTranscriptEl = mustQuery<HTMLElement>("#question-transcript");
+const answerOutputEl = mustQuery<HTMLElement>("#answer-output");
 const eventLogEl = mustQuery<HTMLUListElement>("#event-log");
 
 let currentPage: PageName = "home";
 let activeTheme: ThemeName = loadStoredTheme() ?? "dark";
 let activeStream: MediaStream | null = null;
 let activeSessionId: string | null = null;
+let questionRecognition: SpeechRecognitionLike | null = null;
+let questionTranscript = "";
+let audioResponsePlayer: HTMLAudioElement | null = null;
+let discardQuestionTranscript = false;
+let questionRecordingStopPending = false;
 let peerState: RTCPeerConnectionState = "closed";
 const sendTargetFps = SEND_TARGET_FPS;
 let latestHealthStatus = "unknown";
@@ -492,6 +563,7 @@ const apiBaseUrl = getSignalingBaseUrl();
 const errorCache = new Map<string, string>();
 
 showAdminLiveStatus("No active session.");
+setCameraStatus("Camera idle.");
 
 adminLivePreviewEl.addEventListener("load", () => {
   adminLivePreviewEl.hidden = false;
@@ -509,7 +581,11 @@ adminLivePreviewEl.addEventListener("error", () => {
 const webrtc = new WebRtcClient(
   (state) => {
     peerState = state;
+    if (!questionRecognition && !questionRecordingStopPending) {
+      setQuestionStatus(state === "connected" ? "ready" : "idle");
+    }
     renderConnectionBadge();
+    renderQuestionRecorder();
     renderLatestDashboard();
   },
   (payload) => {
@@ -517,6 +593,12 @@ const webrtc = new WebRtcClient(
   },
   (message) => {
     logger.log(message);
+    if (message === "Data channel open" || message === "Data channel closed") {
+      if (!questionRecognition && !questionRecordingStopPending) {
+        setQuestionStatus(message === "Data channel open" && activeStream ? "ready" : "idle");
+      }
+      renderQuestionRecorder();
+    }
   }
 );
 
@@ -538,6 +620,10 @@ adminHomeEl.addEventListener("click", () => {
 
 startFeedEl.addEventListener("click", () => {
   void toggleFeed();
+});
+
+cameraRecordQuestionEl.addEventListener("click", () => {
+  void toggleCameraQuestionRecording();
 });
 
 directionResetEl.addEventListener("click", () => {
@@ -581,6 +667,10 @@ window.setInterval(() => {
 }, ADMIN_PREVIEW_POLL_MS);
 
 window.addEventListener("beforeunload", () => {
+  resetQuestionRecorder();
+  if (audioResponsePlayer) {
+    audioResponsePlayer.pause();
+  }
   stopDirectionalTelemetry();
   stopStream(activeStream);
   void webrtc.disconnect();
@@ -589,6 +679,7 @@ window.addEventListener("beforeunload", () => {
 showPage("home");
 setTheme(activeTheme, false);
 renderStartButton();
+renderQuestionRecorder();
 renderConnectionBadge();
 renderLatestDashboard();
 renderRelativeDirectionWidget();
@@ -618,8 +709,27 @@ async function toggleFeed(): Promise<void> {
   await startFeed();
 }
 
+async function toggleCameraQuestionRecording(): Promise<void> {
+  try {
+    if (questionRecognition) {
+      await stopQuestionRecording();
+      return;
+    }
+
+    startQuestionRecording();
+  } catch (error) {
+    const message = formatErrorMessage(error);
+    setQuestionStatus("error");
+    setCameraStatus(`Question recording failed: ${message}`);
+    logger.log(`Question recording failed: ${message}`);
+    renderQuestionRecorder();
+  }
+}
+
 async function startFeed(): Promise<void> {
   startFeedEl.disabled = true;
+  setQuestionStatus("connecting");
+  setCameraStatus("Starting camera...");
   resetRelativeDirectionState();
   renderRelativeDirectionWidget();
 
@@ -629,6 +739,7 @@ async function startFeed(): Promise<void> {
     attachStreamToCameraPreview(activeStream);
     await applyViewportCameraConstraints();
     logger.log("Camera stream started");
+    setCameraStatus("Camera started. Connecting feed...");
 
     await webrtc.connect(activeStream);
     activeSessionId = webrtc.getSessionId();
@@ -640,23 +751,31 @@ async function startFeed(): Promise<void> {
 
     await applySendFramerate(sendTargetFps, false);
     await refreshAdminData();
+    setQuestionStatus(webrtc.isReadyToSend() ? "ready" : "connecting");
+    setCameraStatus("Feed connected.");
   } catch (error) {
-    logger.log(`Start feed failed: ${String(error)}`);
+    const message = formatErrorMessage(error);
+    logger.log(`Start feed failed: ${message}`);
+    setQuestionStatus("idle");
+    setCameraStatus(`Feed failed: ${message}`);
     await stopFeed(false);
   } finally {
     startFeedEl.disabled = false;
     renderStartButton();
+    renderQuestionRecorder();
     renderLatestDashboard();
   }
 }
 
 async function stopFeed(shouldLog: boolean): Promise<void> {
+  resetQuestionRecorder();
   const stream = activeStream;
   activeStream = null;
 
   stopDirectionalTelemetry();
   resetRelativeDirectionState();
   await webrtc.disconnect();
+  setQuestionStatus("idle");
   if (stream) {
     stopStream(stream);
   }
@@ -674,9 +793,11 @@ async function stopFeed(shouldLog: boolean): Promise<void> {
 
   if (shouldLog) {
     logger.log("Feed stopped");
+    setCameraStatus("Feed stopped.");
   }
 
   renderStartButton();
+  renderQuestionRecorder();
   renderRelativeDirectionWidget();
   renderLatestDashboard();
 }
@@ -693,6 +814,31 @@ function attachStreamToCameraPreview(stream: MediaStream | null): void {
   }
 
   updateViewportLayout();
+}
+
+function setCameraStatus(message: string): void {
+  cameraStatusEl.textContent = message;
+}
+
+function setQuestionStatus(message: string): void {
+  questionStatusEl.textContent = message;
+}
+
+function setQuestionTranscript(message: string, muted: boolean): void {
+  questionTranscriptEl.textContent = message;
+  questionTranscriptEl.classList.toggle("is-muted", muted);
+}
+
+function setAnswerOutput(message: string): void {
+  answerOutputEl.textContent = message;
+}
+
+function formatErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
 
 function setTheme(theme: ThemeName, persist: boolean): void {
@@ -770,6 +916,20 @@ async function applyViewportCameraConstraints(): Promise<void> {
 
 function renderStartButton(): void {
   startFeedEl.textContent = activeStream ? "Stop Feed" : "Start Feed";
+}
+
+function renderQuestionRecorder(): void {
+  const isRecording = Boolean(questionRecognition);
+  const canStartRecording = Boolean(activeStream) && webrtc.isReadyToSend();
+
+  cameraRecordQuestionEl.textContent = questionRecordingStopPending
+    ? "Sending..."
+    : isRecording
+      ? "Stop Recording"
+      : "Record Question";
+  cameraRecordQuestionEl.classList.toggle("is-recording", isRecording);
+  cameraRecordQuestionEl.setAttribute("aria-pressed", isRecording ? "true" : "false");
+  cameraRecordQuestionEl.disabled = questionRecordingStopPending || (!isRecording && !canStartRecording);
 }
 
 function renderConnectionBadge(): void {
@@ -944,6 +1104,182 @@ function clearAdminLivePreview(message: string): void {
 function showAdminLiveStatus(message: string): void {
   adminLiveStatusEl.textContent = message;
   adminLiveStatusEl.hidden = false;
+}
+
+function startQuestionRecording(): void {
+  if (!activeStream) {
+    throw new Error("Start the feed before recording a question");
+  }
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Wait for the data channel to connect before asking a question");
+  }
+  if (questionRecognition) {
+    throw new Error("Question recording is already in progress");
+  }
+
+  const Recognition = getSpeechRecognitionConstructor();
+  if (!Recognition) {
+    setAnswerOutput("Voice recognition is unavailable in this browser.");
+    setCameraStatus("Voice recognition is unavailable in this browser.");
+    throw new Error("Speech recognition is not available in this browser");
+  }
+
+  const recognition = new Recognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language || "en-US";
+  questionTranscript = "";
+  discardQuestionTranscript = false;
+  questionRecordingStopPending = false;
+
+  recognition.onresult = (event) => {
+    const transcript = collectSpeechTranscript(event.results);
+    questionTranscript = transcript;
+    if (transcript) {
+      setQuestionTranscript(transcript, false);
+    }
+  };
+
+  recognition.onerror = (event) => {
+    logger.log(`Speech recognition error: ${event.error ?? event.message ?? "unknown error"}`);
+  };
+
+  recognition.onend = () => {
+    questionRecognition = null;
+    const transcript = questionTranscript.trim();
+    const shouldDiscard = discardQuestionTranscript;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+
+    if (shouldDiscard) {
+      return;
+    }
+
+    if (!transcript) {
+      setQuestionStatus(webrtc.isReadyToSend() ? "ready" : "idle");
+      setQuestionTranscript("No question heard.", true);
+      setAnswerOutput("No answer yet.");
+      setCameraStatus("No question heard. Try recording again.");
+      logger.log("No speech transcript captured");
+      return;
+    }
+
+    try {
+      sendQuestionText(transcript);
+    } catch (error) {
+      setQuestionStatus("error");
+      setAnswerOutput("Question send failed.");
+      setCameraStatus("Question send failed.");
+      logger.log(`Question send failed: ${formatErrorMessage(error)}`);
+    }
+  };
+
+  questionRecognition = recognition;
+  try {
+    recognition.start();
+  } catch (error) {
+    questionRecognition = null;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+    throw error;
+  }
+
+  setQuestionStatus("listening");
+  setQuestionTranscript("Listening...", true);
+  setAnswerOutput("No answer yet.");
+  setCameraStatus("Listening for a question. Stop recording when finished.");
+  renderQuestionRecorder();
+  logger.log("Listening for question...");
+}
+
+async function stopQuestionRecording(): Promise<void> {
+  if (!questionRecognition) {
+    throw new Error("No active question recording");
+  }
+  if (questionRecordingStopPending) {
+    return;
+  }
+
+  questionRecordingStopPending = true;
+  setQuestionStatus("processing");
+  setAnswerOutput("Processing...");
+  setCameraStatus("Stopping recording and sending question...");
+  renderQuestionRecorder();
+  try {
+    questionRecognition.stop();
+  } catch (error) {
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+    throw error;
+  }
+}
+
+function resetQuestionRecorder(): void {
+  if (questionRecognition) {
+    discardQuestionTranscript = true;
+    questionRecognition.abort();
+  }
+  questionRecognition = null;
+  questionTranscript = "";
+  questionRecordingStopPending = false;
+  renderQuestionRecorder();
+}
+
+function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null {
+  const speechWindow = window as SpeechRecognitionWindow;
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+}
+
+function collectSpeechTranscript(results: SpeechRecognitionResultListLike): string {
+  const parts: string[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const alternative = results[index][0];
+    const transcript = alternative?.transcript.trim();
+    if (transcript) {
+      parts.push(transcript);
+    }
+  }
+
+  return parts.join(" ").trim();
+}
+
+function sendQuestionText(text: string): void {
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Connection closed before the question was sent");
+  }
+
+  const normalizedText = text.trim();
+  if (!normalizedText) {
+    throw new Error("No question text captured");
+  }
+
+  setQuestionStatus("waiting");
+  setAnswerOutput("Processing...");
+  const sent = webrtc.sendJson({ type: "question_text", text: normalizedText });
+  if (!sent) {
+    throw new Error("Data channel is not open");
+  }
+  setCameraStatus("Question sent. Waiting for assistant response...");
+  logger.log(`Question text sent: ${normalizedText}`);
+}
+
+function playReturnedAudio(audioBase64: string): void {
+  const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
+  if (audioResponsePlayer) {
+    audioResponsePlayer.pause();
+  }
+
+  const player = new Audio(audioUrl);
+  audioResponsePlayer = player;
+  setCameraStatus("Playing audio response...");
+  void player.play().catch((error) => {
+    setCameraStatus("Audio playback failed. Showing text response.");
+    logger.log(`Audio playback failed: ${formatErrorMessage(error)}`);
+  });
 }
 
 function resetRelativeDirectionState(): void {
@@ -1534,6 +1870,10 @@ function handleInferencePayload(rawPayload: string): void {
     return;
   }
 
+  if (handleAssistantPayload(parsed, rawPayload)) {
+    return;
+  }
+
   if (!isInferenceMessage(parsed)) {
     logger.log(`Data message: ${rawPayload}`);
     return;
@@ -1546,4 +1886,53 @@ function handleInferencePayload(rawPayload: string): void {
   }
 
   logger.log(`Inference tick: ${message.timestamp}`);
+}
+
+function handleAssistantPayload(parsed: unknown, rawPayload: string): boolean {
+  if (typeof parsed !== "object" || parsed === null) {
+    return false;
+  }
+
+  const candidate = parsed as Record<string, unknown>;
+  const messageType = candidate.type;
+  if (messageType === "status") {
+    const status = typeof candidate.status === "string" ? candidate.status : null;
+    const message = typeof candidate.message === "string" ? candidate.message : null;
+    setQuestionStatus(status ?? message ?? "processing");
+    if (message) {
+      setCameraStatus(message);
+      logger.log(message);
+    }
+    return true;
+  }
+
+  if (messageType === "error") {
+    const message = typeof candidate.message === "string" ? candidate.message : rawPayload;
+    setQuestionStatus("error");
+    setAnswerOutput(message);
+    setCameraStatus(message);
+    logger.log(message);
+    return true;
+  }
+
+  if (messageType !== "answer") {
+    return false;
+  }
+
+  if (typeof candidate.transcript === "string" && candidate.transcript.trim()) {
+    setQuestionTranscript(candidate.transcript, false);
+  }
+  if (typeof candidate.answer === "string") {
+    setAnswerOutput(candidate.answer);
+  }
+  setQuestionStatus("complete");
+  setCameraStatus("Assistant response received.");
+
+  if (typeof candidate.audio_error === "string" && candidate.audio_error.trim()) {
+    logger.log(`Speech unavailable: ${candidate.audio_error}`);
+  }
+  if (typeof candidate.audio_base64 === "string" && candidate.audio_base64.length > 0) {
+    playReturnedAudio(candidate.audio_base64);
+  }
+  return true;
 }

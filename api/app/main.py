@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
+import logging
 import math
 import os
 import uuid
@@ -20,6 +22,11 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
+
+from .llm import OllamaCompletionError, generate_assistant_answer
+from .scene_context import build_scene_context
+from .tts import AudioProcessingError, text_to_speech_bytes
+from .vlm import VisionModelError, query_image_model
 
 
 class OfferRequest(BaseModel):
@@ -60,6 +67,16 @@ SESSION_MANIFEST_FILENAME = "session.json"
 MAX_INFERENCE_SAMPLE_AGE_MS = 3000
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
 GROUP_SESSION_TIME_CUT_SECONDS = 10 # seconds
+ENABLE_MOCK_RESULTS = os.getenv("ENABLE_MOCK_RESULTS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_FALLBACK_ANSWER = (
+    "I cannot reach the full assistant right now, but I will keep monitoring the scene."
+)
+logger = logging.getLogger("lens-plus.api")
 
 
 def clamp_analysis_fps(value: float) -> float:
@@ -99,6 +116,7 @@ class Session:
     peer_connection: RTCPeerConnection
     data_channel: Any | None = None
     frame_task: asyncio.Task[None] | None = None
+    question_task: asyncio.Task[None] | None = None
     mock_task: asyncio.Task[None] | None = None
     analysis_target_fps: float = CONFIGURED_ANALYSIS_TARGET_FPS
     total_frames: int = 0
@@ -170,6 +188,7 @@ SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92
 
 @app.on_event("startup")
 async def startup() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
     av.logging.set_level(av.logging.ERROR)
     SESSION_ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
     app.state.gc_task = asyncio.create_task(session_gc())
@@ -413,11 +432,15 @@ async def offer(payload: OfferRequest) -> OfferResponse:
 
         @channel.on("message")
         def on_message(message: Any) -> None:
-            ingest_directional_message(session=session, message=message)
+            asyncio.create_task(handle_data_channel_message(session=session, message=message))
 
         @channel.on("open")
         def on_open() -> None:
-            if session.mock_task is None:
+            if ENABLE_MOCK_RESULTS and session.mock_task is None:
+                session.mock_task = asyncio.create_task(send_mock_results(session))
+
+        if getattr(channel, "readyState", "") == "open":
+            if ENABLE_MOCK_RESULTS and session.mock_task is None:
                 session.mock_task = asyncio.create_task(send_mock_results(session))
 
     @peer_connection.on("connectionstatechange")
@@ -495,6 +518,287 @@ async def ingest_inference(
     return IceResponse(ok=True)
 
 
+async def send_data_channel_json(session: Session, payload: dict[str, Any]) -> bool:
+    channel = session.data_channel
+    if channel is None or getattr(channel, "readyState", "") != "open":
+        return False
+
+    try:
+        channel.send(json.dumps(payload))
+        session.updated_at = datetime.now(timezone.utc)
+        return True
+    except Exception as error:
+        logger.warning("Data-channel send failed: %s", error)
+        return False
+
+
+async def send_status(session: Session, status: str, message: str) -> None:
+    await send_data_channel_json(
+        session,
+        {
+            "type": "status",
+            "status": status,
+            "message": message,
+        },
+    )
+
+
+async def send_error(session: Session, message: str) -> None:
+    await send_data_channel_json(
+        session,
+        {
+            "type": "error",
+            "message": message,
+        },
+    )
+
+
+async def send_answer(
+    session: Session,
+    *,
+    transcript: str,
+    answer: str,
+    audio_base64: str | None = None,
+    audio_error: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "type": "answer",
+        "transcript": transcript,
+        "answer": answer,
+    }
+    if audio_base64:
+        payload["audio_base64"] = audio_base64
+    if audio_error:
+        payload["audio_error"] = audio_error
+    await send_data_channel_json(session, payload)
+
+
+async def handle_data_channel_message(session: Session, message: Any) -> None:
+    payload = decode_data_channel_message(message)
+    if payload is None:
+        session.directional_parse_errors += 1
+        await send_error(session, "Failed to parse data-channel message")
+        return
+
+    if not isinstance(payload, dict):
+        session.directional_messages_ignored += 1
+        await send_error(session, "Invalid data-channel message payload")
+        return
+
+    message_type = payload.get("type")
+    if message_type == "client_sensor":
+        ingest_directional_payload(session=session, payload=payload)
+        return
+
+    if message_type in {"question_audio", "question_audio_chunk"}:
+        await send_error(
+            session,
+            "Audio uploads are not supported. Send question_text instead.",
+        )
+        return
+
+    if message_type == "question_text":
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            await send_error(session, "No question text provided")
+            return
+        start_question_task(session=session, text=text)
+        return
+
+    session.directional_messages_ignored += 1
+    await send_error(session, f"Unknown data-channel message type: {message_type}")
+
+
+def decode_data_channel_message(message: Any) -> Any | None:
+    payload: Any = message
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+    return payload
+
+
+def start_question_task(session: Session, text: str) -> None:
+    existing_task = session.question_task
+    if existing_task is not None and not existing_task.done():
+        logger.info("Question rejected because another question is active text_len=%d", len(text))
+        asyncio.create_task(
+            send_error(session, "A question is already being processed. Please wait.")
+        )
+        return
+
+    logger.info("Starting assistant question task text_len=%d", len(text))
+    task = asyncio.create_task(run_question_pipeline(session=session, text=text))
+    session.question_task = task
+
+    def clear_finished_task(finished_task: asyncio.Task[None]) -> None:
+        if session.question_task is finished_task:
+            session.question_task = None
+
+    task.add_done_callback(clear_finished_task)
+
+
+async def run_question_pipeline(session: Session, text: str) -> None:
+    logger.info(
+        "Assistant pipeline started transcript_len=%d has_frame=%s artifact_id=%s",
+        len(text),
+        session.latest_jpeg is not None,
+        session.artifact_id,
+    )
+    await send_status(session, "received_question", "Question received.")
+
+    if session.latest_jpeg is None:
+        logger.warning("Assistant pipeline aborted: no latest frame available")
+        await send_error(session, "No image frame available yet")
+        return
+
+    image_bytes = session.latest_jpeg
+    scene_context = build_scene_context(
+        artifact_dir=session.artifact_dir,
+        latest_jpeg_at=session.latest_jpeg_at,
+        latest_frame_at=session.last_frame_at,
+        latest_directional_context=session.latest_processed_directional,
+        latest_detection_context=session.latest_processed_detections,
+    )
+    missing_context = scene_context.get("missing_context")
+    logger.info("Scene context loaded missing_context=%s", missing_context)
+    vlm_text: str | None = None
+
+    await send_status(session, "running_vlm", "Inspecting the latest camera frame.")
+    logger.info("Running VLM stage image_bytes=%d question_len=%d", len(image_bytes), len(text))
+    try:
+        vlm_text = await query_image_model(image_bytes, text)
+        logger.info("VLM stage completed vlm_chars=%d", len(vlm_text))
+    except VisionModelError as error:
+        scene_context["warnings"].append(f"VLM unavailable: {error}")
+        logger.warning("VLM stage unavailable: %s", error)
+        await send_status(
+            session,
+            "running_llm",
+            "Visual model unavailable; using structured context.",
+        )
+    except Exception as error:
+        scene_context["warnings"].append(f"VLM failed: {error}")
+        logger.warning("VLM stage failed: %s", error)
+        await send_status(
+            session,
+            "running_llm",
+            "Visual model failed; using structured context.",
+        )
+
+    if vlm_text is not None:
+        await send_status(session, "running_llm", "Composing a navigation answer.")
+
+    logger.info("Running Ollama/Qwen answer stage")
+    try:
+        answer = await generate_assistant_answer(
+            question=text,
+            scene_context=scene_context,
+            vlm_text=vlm_text,
+        )
+        logger.info("Ollama/Qwen answer stage completed answer_chars=%d", len(answer))
+    except OllamaCompletionError as error:
+        scene_context["warnings"].append(f"Ollama unavailable: {error}")
+        logger.warning("Ollama/Qwen answer stage unavailable: %s", error)
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+    except Exception as error:
+        scene_context["warnings"].append(f"Ollama failed: {error}")
+        logger.warning("Ollama/Qwen answer stage failed: %s", error)
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+
+    if not answer.strip():
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+
+    await send_status(session, "generating_speech", "Generating speech.")
+    logger.info("Running TTS stage answer_chars=%d", len(answer))
+    audio_base64: str | None = None
+    audio_error: str | None = None
+    try:
+        audio_bytes = await text_to_speech_bytes(answer)
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        logger.info("TTS stage completed audio_bytes=%d", len(audio_bytes))
+    except AudioProcessingError as error:
+        audio_error = str(error)
+        logger.warning("TTS stage unavailable: %s", error)
+    except Exception as error:
+        audio_error = f"Speech generation failed: {error}"
+        logger.warning("TTS stage failed: %s", error)
+
+    await send_answer(
+        session,
+        transcript=text,
+        answer=answer,
+        audio_base64=audio_base64,
+        audio_error=audio_error,
+    )
+    logger.info(
+        "Assistant pipeline completed answer_chars=%d audio=%s",
+        len(answer),
+        "yes" if audio_base64 else "no",
+    )
+
+
+def build_fallback_answer(
+    *, scene_context: dict[str, Any], vlm_text: str | None
+) -> str:
+    if isinstance(vlm_text, str) and vlm_text.strip():
+        return vlm_text.strip()
+
+    parts: list[str] = []
+    depth = scene_context.get("depth")
+    if isinstance(depth, dict):
+        proximity_detail = depth.get("proximity_detail")
+        proximity_status = depth.get("proximity_status")
+        if isinstance(proximity_detail, str) and proximity_detail:
+            parts.append(proximity_detail)
+        elif isinstance(proximity_status, str) and proximity_status:
+            parts.append(f"Depth status is {proximity_status.lower()}.")
+
+    segmentation = scene_context.get("segmentation")
+    if isinstance(segmentation, dict):
+        walkable_status = segmentation.get("walkable_status")
+        direction = segmentation.get("direction")
+        if isinstance(walkable_status, str) and isinstance(direction, str):
+            parts.append(f"Segmentation says {walkable_status.lower()}; suggested direction is {direction.lower()}.")
+
+    detections = extract_fallback_detection_labels(scene_context)
+    if detections:
+        parts.append(f"Detected nearby objects include {', '.join(detections[:4])}.")
+
+    if parts:
+        return " ".join(parts)[:420]
+    return DEFAULT_FALLBACK_ANSWER
+
+
+def extract_fallback_detection_labels(scene_context: dict[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+    object_detection = scene_context.get("object_detection")
+    if isinstance(object_detection, dict) and isinstance(object_detection.get("detections"), list):
+        candidates = object_detection["detections"]
+
+    if not candidates:
+        live_detections = scene_context.get("live_detections")
+        if isinstance(live_detections, dict) and isinstance(live_detections.get("objects"), list):
+            candidates = live_detections["objects"]
+
+    labels: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        label = candidate.get("label")
+        if isinstance(label, str) and label and label not in labels:
+            labels.append(label)
+    return labels
+
+
 async def send_mock_results(session: Session) -> None:
     object_labels = ["chair", "desk", "door", "bag", "keys", "person"]
     while True:
@@ -535,21 +839,15 @@ async def send_mock_results(session: Session) -> None:
 
 
 def ingest_directional_message(session: Session, message: Any) -> None:
-    payload: Any = message
-    if isinstance(payload, bytes):
-        try:
-            payload = payload.decode("utf-8")
-        except UnicodeDecodeError:
-            session.directional_parse_errors += 1
-            return
+    payload = decode_data_channel_message(message)
+    if payload is None:
+        session.directional_parse_errors += 1
+        return
 
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
-            session.directional_parse_errors += 1
-            return
+    ingest_directional_payload(session=session, payload=payload)
 
+
+def ingest_directional_payload(session: Session, payload: Any) -> None:
     normalized_payload = normalize_directional_payload(payload)
     if normalized_payload is None:
         session.directional_messages_ignored += 1
@@ -771,7 +1069,7 @@ async def close_session(session_id: str) -> None:
 
     closed_at = datetime.now(timezone.utc)
 
-    for task in [session.frame_task, session.mock_task]:
+    for task in [session.frame_task, session.question_task, session.mock_task]:
         if task:
             task.cancel()
 
