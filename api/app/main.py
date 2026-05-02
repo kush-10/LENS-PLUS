@@ -29,6 +29,7 @@ from .llm import (
     prompt_audit_enabled,
     update_prompt_audit,
 )
+from .model_context import ModelContextWaitResult, wait_for_prior_complete_group
 from .scene_context import build_scene_context
 from .tts import AudioProcessingError, text_to_speech_bytes
 from .vlm import VisionModelError, query_image_model
@@ -81,6 +82,7 @@ ENABLE_MOCK_RESULTS = os.getenv("ENABLE_MOCK_RESULTS", "false").strip().lower() 
 DEFAULT_FALLBACK_ANSWER = (
     "I cannot reach the full assistant right now, but I will keep monitoring the scene."
 )
+STRUCTURED_CONTEXT_NOT_READY_MESSAGE = "Structured scene context is not ready yet."
 logger = logging.getLogger("lens-plus.api")
 
 
@@ -190,6 +192,14 @@ def read_int_env(name: str, default: int) -> int:
 
 SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.05))
 SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92)))
+MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS = max(
+    0.0,
+    read_float_env("MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS", 120.0),
+)
+MODEL_CONTEXT_POLL_SECONDS = max(
+    0.05,
+    read_float_env("MODEL_CONTEXT_POLL_SECONDS", 0.5),
+)
 
 
 @app.on_event("startup")
@@ -609,7 +619,11 @@ async def handle_data_channel_message(session: Session, message: Any) -> None:
         if not text:
             await send_error(session, "No question text provided")
             return
-        start_question_task(session=session, text=text)
+        start_question_task(
+            session=session,
+            text=text,
+            question_received_at=datetime.now(timezone.utc),
+        )
         return
 
     session.directional_messages_ignored += 1
@@ -633,7 +647,11 @@ def decode_data_channel_message(message: Any) -> Any | None:
     return payload
 
 
-def start_question_task(session: Session, text: str) -> None:
+def start_question_task(
+    session: Session,
+    text: str,
+    question_received_at: datetime,
+) -> None:
     existing_task = session.question_task
     if existing_task is not None and not existing_task.done():
         logger.info("Question rejected because another question is active text_len=%d", len(text))
@@ -643,7 +661,13 @@ def start_question_task(session: Session, text: str) -> None:
         return
 
     logger.info("Starting assistant question task text_len=%d", len(text))
-    task = asyncio.create_task(run_question_pipeline(session=session, text=text))
+    task = asyncio.create_task(
+        run_question_pipeline(
+            session=session,
+            text=text,
+            question_received_at=question_received_at,
+        )
+    )
     session.question_task = task
 
     def clear_finished_task(finished_task: asyncio.Task[None]) -> None:
@@ -678,7 +702,11 @@ def safe_update_prompt_audit(
         logger.warning("Prompt audit write failed: %s", error)
 
 
-async def run_question_pipeline(session: Session, text: str) -> None:
+async def run_question_pipeline(
+    session: Session,
+    text: str,
+    question_received_at: datetime,
+) -> None:
     logger.info(
         "Assistant pipeline started transcript_len=%d has_frame=%s artifact_id=%s",
         len(text),
@@ -695,16 +723,6 @@ async def run_question_pipeline(session: Session, text: str) -> None:
     image_bytes = session.latest_jpeg
     image_source = "latest_session_jpeg"
     question_max_frame_index = session.processed_frames
-    scene_context = build_scene_context(
-        artifact_dir=session.artifact_dir,
-        latest_jpeg_at=session.latest_jpeg_at,
-        latest_frame_at=session.last_frame_at,
-        latest_directional_context=session.latest_processed_directional,
-        latest_detection_context=session.latest_processed_detections,
-        after_frame_index=session.last_answered_frame_index,
-        max_frame_index=question_max_frame_index,
-    )
-    scene_context["frame"]["vlm_image_source"] = image_source
     prompt_audit_path = create_prompt_audit_path(session)
     safe_update_prompt_audit(
         prompt_audit_path,
@@ -718,26 +736,85 @@ async def run_question_pipeline(session: Session, text: str) -> None:
             "question": {
                 "text": text,
                 "chars": len(text),
+                "received_at": question_received_at.isoformat(),
+                "max_frame_index_at_question": question_max_frame_index,
             },
-            "frame_window": scene_context.get("frame_window"),
             "vlm_image_source": image_source,
-            "scene_context": scene_context,
         },
     )
-    missing_context = scene_context.get("missing_context")
-    logger.info(
-        "Scene context loaded missing_context=%s frame_window=%s image_source=%s audit_path=%s",
-        missing_context,
-        scene_context.get("frame_window"),
-        image_source,
-        str(prompt_audit_path) if prompt_audit_path else None,
-    )
-    vlm_text: str | None = None
 
     await send_status(session, "running_vlm", "Inspecting the latest camera frame.")
     logger.info("Running VLM stage image_bytes=%d question_len=%d", len(image_bytes), len(text))
+    vlm_task = asyncio.create_task(query_image_model(image_bytes, text))
+
+    await send_status(
+        session,
+        "waiting_model_context",
+        "Waiting for the latest complete processed frame group.",
+    )
+    model_context_task = asyncio.create_task(
+        wait_for_prior_complete_group(
+            artifact_dir=session.artifact_dir,
+            session_started_at=session.started_at,
+            question_received_at=question_received_at,
+            group_duration_seconds=GROUP_SESSION_TIME_CUT_SECONDS,
+            timeout_seconds=MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS,
+            poll_seconds=MODEL_CONTEXT_POLL_SECONDS,
+        )
+    )
+
     try:
-        vlm_text = await query_image_model(image_bytes, text)
+        model_context = await model_context_task
+    except Exception as error:
+        logger.warning("Structured model context wait failed: %s", error)
+        model_context = ModelContextWaitResult(
+            ready=False,
+            status="failed",
+            reason=f"Structured model context wait failed: {error}",
+            waited_seconds=0.0,
+        )
+
+    if model_context.ready:
+        await send_status(
+            session,
+            "model_context_ready",
+            f"Using processed frame group {model_context.selected_group}.",
+        )
+    else:
+        await send_status(
+            session,
+            "model_context_unavailable",
+            "Structured context is not ready; using the visual model only.",
+        )
+
+    scene_context = build_scene_context(
+        artifact_dir=session.artifact_dir,
+        latest_jpeg_at=session.latest_jpeg_at,
+        latest_frame_at=session.last_frame_at,
+        latest_directional_context=session.latest_processed_directional,
+        latest_detection_context=session.latest_processed_detections,
+        frame_paths=list(model_context.frame_paths) if model_context.ready else [],
+    )
+    scene_context["frame"]["vlm_image_source"] = image_source
+    scene_context["structured_context_ready"] = model_context.ready
+    scene_context["structured_model_context"] = model_context.to_audit_dict()
+    if not model_context.ready:
+        scene_context["missing_context"].append("structured_model_context")
+        scene_context["warnings"].append(STRUCTURED_CONTEXT_NOT_READY_MESSAGE)
+
+    missing_context = scene_context.get("missing_context")
+    logger.info(
+        "Scene context loaded missing_context=%s frame_window=%s image_source=%s model_context=%s audit_path=%s",
+        missing_context,
+        scene_context.get("frame_window"),
+        image_source,
+        model_context.to_audit_dict(),
+        str(prompt_audit_path) if prompt_audit_path else None,
+    )
+
+    vlm_text: str | None = None
+    try:
+        vlm_text = await vlm_task
         logger.info("VLM stage completed vlm_chars=%d", len(vlm_text))
         safe_update_prompt_audit(
             prompt_audit_path,
@@ -766,7 +843,7 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         await send_status(
             session,
             "running_llm",
-            "Visual model unavailable; using structured context.",
+            "Visual model unavailable; using available context.",
         )
     except Exception as error:
         scene_context["warnings"].append(f"VLM failed: {error}")
@@ -784,11 +861,19 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         await send_status(
             session,
             "running_llm",
-            "Visual model failed; using structured context.",
+            "Visual model failed; using available context.",
         )
 
-    if vlm_text is not None:
-        await send_status(session, "running_llm", "Composing a navigation answer.")
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "model_context": model_context.to_audit_dict(),
+            "frame_window": scene_context.get("frame_window"),
+            "scene_context": scene_context,
+        },
+    )
+
+    await send_status(session, "running_llm", "Composing a navigation answer.")
 
     logger.info("Running Ollama/Qwen answer stage")
     answer_source = "ollama"
@@ -815,6 +900,9 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         answer_source = "fallback"
         answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
 
+    if not model_context.ready:
+        answer = ensure_structured_context_warning(answer)
+
     await send_status(session, "generating_speech", "Generating speech.")
     logger.info("Running TTS stage answer_chars=%d", len(answer))
     audio_base64: str | None = None
@@ -837,10 +925,11 @@ async def run_question_pipeline(session: Session, text: str) -> None:
         audio_base64=audio_base64,
         audio_error=audio_error,
     )
-    session.last_answered_frame_index = max(
-        session.last_answered_frame_index,
-        question_max_frame_index,
-    )
+    if model_context.ready and model_context.last_frame_index is not None:
+        session.last_answered_frame_index = max(
+            session.last_answered_frame_index,
+            model_context.last_frame_index,
+        )
     safe_update_prompt_audit(
         prompt_audit_path,
         {
@@ -850,6 +939,7 @@ async def run_question_pipeline(session: Session, text: str) -> None:
                 "answer": answer,
                 "answer_chars": len(answer),
                 "last_answered_frame_index": session.last_answered_frame_index,
+                "structured_context_ready": model_context.ready,
                 "audio_generated": audio_base64 is not None,
                 "audio_error": audio_error,
             }
@@ -892,6 +982,15 @@ def build_fallback_answer(
     if parts:
         return " ".join(parts)[:420]
     return DEFAULT_FALLBACK_ANSWER
+
+
+def ensure_structured_context_warning(answer: str) -> str:
+    cleaned = answer.strip()
+    if STRUCTURED_CONTEXT_NOT_READY_MESSAGE.lower() in cleaned.lower():
+        return cleaned
+    if not cleaned:
+        return STRUCTURED_CONTEXT_NOT_READY_MESSAGE
+    return f"{STRUCTURED_CONTEXT_NOT_READY_MESSAGE} {cleaned}"
 
 
 def extract_fallback_detection_labels(scene_context: dict[str, Any]) -> list[str]:

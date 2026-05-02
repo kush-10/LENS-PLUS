@@ -335,7 +335,7 @@ The final answer includes text and, when local TTS succeeds, MP3 audio as base64
 }
 ```
 
-If SmolVLM sidecars, the LLM, or TTS fail, the backend still returns the best available text answer and includes `audio_error` when only speech generation fails.
+If structured model sidecars, SmolVLM, the LLM, or TTS fail, the backend still returns the best available text answer and includes `audio_error` when only speech generation fails.
 
 ## Linking this to the model pipeline
 
@@ -347,7 +347,10 @@ The integration flow is:
 2. The model pipeline watches completed groups and writes sidecars next to those frames.
 3. Object detection writes `frame-*.detections.json`.
 4. Segmentation and depth write `frame-*.navigation.json`.
-5. On `question_text`, the API builds summarized scene context from all artifact frames since the previous answer, queries SmolVLM with the latest frame, sends both to Ollama/Qwen, then returns text and TTS audio over the data channel.
+5. On `question_text`, the API queries SmolVLM with the latest frame while waiting for the latest fully processed group that ended before the question time.
+6. A group is ready only when every frame in it has object detection, segmentation, and depth sidecars.
+7. If no prior group exists, or if the selected group is still incomplete after `MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS`, the API answers with VLM-only context and marks structured context as not ready.
+8. The API sends structured context plus VLM text to Ollama/Qwen, then returns text and TTS audio over the data channel.
 
 The old `send_mock_results()` path remains available only when `ENABLE_MOCK_RESULTS=true`.
 

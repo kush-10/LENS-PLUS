@@ -46,22 +46,34 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
 
 ## Model Files Setup
 
-The Docker model pipeline downloads the required checkpoint archive from the Dropbox link below during image build when the files are not already present locally.
+The Docker model pipeline expects the required model assets to already exist locally before image build. It does not download model files during Docker build.
 
 1. **Download models from Dropbox:**
    
    Access the model files here: [LENS-PLUS Dropbox](https://www.dropbox.com/scl/fo/e7wcpej7kzxjdm7qqyulo/AN6OHj5xWruEfk5qEqyan6s?rlkey=gg16nhb58a7rfd0rdv9j75e6p&st=kw2e3fbt&dl=0)
 
-2. **Place the models in the correct directories:**
+2. **Place the models/source in the correct directories:**
+
+   - `yolov8n.pt`
+     - Place in: `models/object_detection/`
+
+   - `yolov8n-seg.pt`
+     - Place in: `models/segmentation/src/`
 
    - `deeplabv3plus_mobilenet_finetuned.pth`
      - Place in: `models/segmentation/src/`
-   
+
+   - `DeepLabV3Plus-Pytorch`
+     - Place the source checkout in: `models/segmentation/src/DeepLabV3Plus-Pytorch/`
+     - The directory must contain `network/`.
+
    - `depth_anything_v2_metric_hypersim_vits.pth`
       - Place in: `models/depth_estimation/checkpoints/`
       - **Note:** Create the `checkpoints/` directory if it doesn't exist
 
-If those files already exist locally, they are copied into the `model-pipeline` image and the archive download is skipped. The Docker model image also installs the public DeepLabV3Plus-Pytorch code dependency during build if `models/segmentation/src/DeepLabV3Plus-Pytorch/network` is not already present.
+If any required local asset is missing, the `model-pipeline` image build fails fast. This prevents the running container from silently depending on external downloads.
+
+Public upstream sources used by this repo include Ultralytics YOLO weights, the DeepLabV3Plus-Pytorch repository, and the Depth Anything V2 metric-depth checkpoint listed in `models/depth_estimation/Depth-Anything-V2/metric_depth/README.md`.
 
 ```bash
    # Example: Creating the checkpoints directory
@@ -97,6 +109,8 @@ ENABLE_LLM_PROMPT_AUDIT=true
 SMOLVLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
 SMOLVLM_MAX_NEW_TOKENS=120
 SMOLVLM_NUM_BEAMS=1
+MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS=120
+MODEL_CONTEXT_POLL_SECONDS=0.5
 ```
 
 `ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
@@ -115,6 +129,10 @@ Optional backend env var:
   - Directory where per-session processed frame dumps and manifest files are written.
 - `ENABLE_MOCK_RESULTS` (default: `false`)
   - Enables the old mock inference ticks for scaffold testing.
+- `MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS` (default: `120`)
+  - Maximum time to wait for the latest prior frame group to receive detection, segmentation, and depth sidecars after a question is asked.
+- `MODEL_CONTEXT_POLL_SECONDS` (default: `0.5`)
+  - Poll interval while waiting for model sidecars.
 
 For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PROXY_TARGET=http://api:8000` (the helper script below configures this automatically).
 

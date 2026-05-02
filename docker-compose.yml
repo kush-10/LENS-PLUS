@@ -17,6 +17,8 @@ services:
       - SMOLVLM_MODEL_ID=${SMOLVLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
       - SMOLVLM_MAX_NEW_TOKENS=${SMOLVLM_MAX_NEW_TOKENS:-120}
       - SMOLVLM_NUM_BEAMS=${SMOLVLM_NUM_BEAMS:-1}
+      - MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS=${MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS:-120}
+      - MODEL_CONTEXT_POLL_SECONDS=${MODEL_CONTEXT_POLL_SECONDS:-0.5}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -34,7 +36,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - MPLBACKEND=Agg
-      - YOLO_CONFIG_DIR=/tmp
+      - YOLO_CONFIG_DIR=/tmp/ultralytics
     volumes:
       - ./api/app/session_artifacts:/app/api/app/session_artifacts
     depends_on:

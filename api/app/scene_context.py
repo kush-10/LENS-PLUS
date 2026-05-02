@@ -22,6 +22,7 @@ def build_scene_context(
     latest_detection_context: dict[str, Any] | None,
     after_frame_index: int | None = None,
     max_frame_index: int | None = None,
+    frame_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
     context: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -55,13 +56,17 @@ def build_scene_context(
         "artifact_id": artifact_dir.name,
     }
 
-    frame_paths = list_artifact_frame_paths(artifact_dir)
-    if not frame_paths:
+    selected_frame_paths = (
+        list_artifact_frame_paths(artifact_dir)
+        if frame_paths is None
+        else sorted(frame_paths, key=natural_key)
+    )
+    if not selected_frame_paths:
         context["missing_context"].append("artifact_frames")
         return context
 
     frame_window = summarize_frame_window(
-        frame_paths=frame_paths,
+        frame_paths=selected_frame_paths,
         after_frame_index=after_frame_index,
         max_frame_index=max_frame_index,
     )
