@@ -106,7 +106,6 @@ class ModelContextTestCase(unittest.IsolatedAsyncioTestCase):
             artifact_dir=self.artifact_dir,
             latest_jpeg_at=None,
             latest_frame_at=None,
-            latest_directional_context=None,
             latest_detection_context=None,
             frame_paths=[group_two_frame],
         )

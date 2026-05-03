@@ -8,9 +8,14 @@ from pathlib import Path
 from typing import Any, Callable
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+API_DIR = PROJECT_ROOT / "api"
+APP_DIR = API_DIR / "app"
+for import_path in (API_DIR, APP_DIR):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
+
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 try:
     import numpy as np
@@ -79,9 +84,21 @@ def _load_samples(path: Path) -> tuple[list[dict[str, Any]], list[GroundTruthBox
 
 
 def _predict_image(
-    model: YOLO, image_path: Path, *, imgsz: int, conf: float, image_id: str
+    model: YOLO,
+    image_path: Path,
+    *,
+    imgsz: int,
+    conf: float,
+    image_id: str,
+    device: str,
 ) -> list[PredictedBox]:
-    result = model.predict(str(image_path), imgsz=imgsz, conf=conf, verbose=False)[0]
+    result = model.predict(
+        str(image_path),
+        imgsz=imgsz,
+        conf=conf,
+        verbose=False,
+        device=device,
+    )[0]
     predictions: list[PredictedBox] = []
     names = model.names
     if result.boxes is None:
@@ -139,7 +156,11 @@ def _add_gaussian_noise(image: Image.Image, sigma: float) -> Image.Image:
 def main() -> int:
     args = parse_args()
     np.random.seed(42)
+    device = select_torch_device(component_env_var="LENS_DETECTION_DEVICE")
+    yolo_device = yolo_device_from_torch_device(device)
     model = YOLO(args.model)
+    model.to(device)
+    print(f"Robustness eval using device: {device}")
     image_entries, ground_truths = _load_samples(Path(args.input).resolve())
     if not image_entries:
         raise SystemExit("No images found in input.")
@@ -168,6 +189,7 @@ def main() -> int:
                         imgsz=args.imgsz,
                         conf=args.conf,
                         image_id=image_id,
+                        device=yolo_device,
                     )
                 )
         finally:

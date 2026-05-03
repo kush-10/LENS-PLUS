@@ -39,8 +39,9 @@ def synthesize_speech_sync(text: str) -> bytes:
     if not text.strip():
         raise AudioProcessingError("Cannot generate speech for an empty response")
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-        wav_path = Path(wav_file.name)
+    input_suffix = ".aiff" if SAY_BIN else ".wav"
+    with tempfile.NamedTemporaryFile(suffix=input_suffix, delete=False) as input_file:
+        input_path = Path(input_file.name)
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
         mp3_path = Path(mp3_file.name)
@@ -48,12 +49,12 @@ def synthesize_speech_sync(text: str) -> bytes:
     try:
         if SAY_BIN:
             run_subprocess(
-                [SAY_BIN, "-o", str(wav_path), text],
+                [SAY_BIN, "-o", str(input_path), text],
                 "Failed to synthesize speech with the macOS voice engine",
             )
         elif ESPEAK_BIN:
             run_subprocess(
-                [ESPEAK_BIN, "-w", str(wav_path), text],
+                [ESPEAK_BIN, "-w", str(input_path), text],
                 "Failed to synthesize speech with the local voice engine",
             )
         else:
@@ -66,7 +67,7 @@ def synthesize_speech_sync(text: str) -> bytes:
                 FFMPEG_BIN,
                 "-y",
                 "-i",
-                str(wav_path),
+                str(input_path),
                 "-codec:a",
                 "libmp3lame",
                 "-q:a",
@@ -77,7 +78,7 @@ def synthesize_speech_sync(text: str) -> bytes:
         )
         return mp3_path.read_bytes()
     finally:
-        wav_path.unlink(missing_ok=True)
+        input_path.unlink(missing_ok=True)
         mp3_path.unlink(missing_ok=True)
 
 

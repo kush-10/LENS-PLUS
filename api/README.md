@@ -13,7 +13,6 @@ It is intentionally lightweight so you can swap in a real model pipeline with mi
 - Exposes latest JPEG snapshot per session (`GET /debug/sessions/{session_id}/latest.jpg`)
 - Writes all processed session frames to disk (`api/app/session_artifacts/` by default)
 - Reads model sidecars written beside those frames by the Docker `model-pipeline` service
-- Receives directional telemetry on data channel `results` using `client_sensor`
 - Receives voice-question transcripts using `question_text`
 - Builds answer context by summarizing frame metadata plus `.detections.json` and `.navigation.json` sidecars since the previous answer
 - Uses SmolVLM, local Ollama/Qwen, and local TTS for answer text and optional MP3 audio
@@ -23,11 +22,10 @@ Core implementation is in `api/app/main.py`.
 ## Run locally
 
 ```bash
-cd api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r api/requirements.txt torchvision matplotlib
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
 ```
 
 Health check:
@@ -55,6 +53,11 @@ http://localhost:8000/health
   - Ollama request timeout and response length controls.
 - `ENABLE_LLM_PROMPT_AUDIT` (default: `true`)
   - Writes full raw Ollama/Qwen prompt and answer audits under each session artifact in `question-audits/`.
+- `LENS_COMPUTE_DEVICE` (default: `auto`)
+  - Selects torch/Ultralytics inference device. `auto` prefers CUDA, then Apple MPS, then CPU.
+  - Supported explicit values include `cpu`, `cuda`, `cuda:0`, and `mps`.
+- `LENS_VLM_DEVICE`, `LENS_DETECTION_DEVICE`, `LENS_SEGMENTATION_DEVICE`, `LENS_DEPTH_DEVICE`
+  - Optional per-component overrides. Leave empty to inherit `LENS_COMPUTE_DEVICE`.
 - `SMOLVLM_MODEL_ID` (default: `HuggingFaceTB/SmolVLM-256M-Instruct`)
   - Hugging Face model id for local visual-language analysis.
 - `SMOLVLM_MAX_NEW_TOKENS` and `SMOLVLM_NUM_BEAMS`
@@ -63,12 +66,14 @@ http://localhost:8000/health
 Examples:
 
 ```bash
-ANALYSIS_TARGET_FPS=15 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+ANALYSIS_TARGET_FPS=15 python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
 ```
 
 Local TTS requires macOS `say` or Linux `espeak-ng`, plus `ffmpeg` for MP3 encoding. The API Dockerfile installs `espeak-ng` and `ffmpeg`.
 
-With Docker Compose (root `docker-compose.yml`), this value is passed into the `api` container via:
+For local no-Docker GPU use, set `LENS_COMPUTE_DEVICE=mps` on Apple Silicon or `LENS_COMPUTE_DEVICE=cuda` on an NVIDIA CUDA machine before starting the API and `models/start_pipeline.py`.
+
+With Docker Compose (root `docker-compose.yml`), `ANALYSIS_TARGET_FPS` is passed into the `api` container via:
 
 ```yaml
 ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
@@ -287,7 +292,6 @@ Every session creates:
 
 - `frame_id` / `frame_index`
 - `frame_at`
-- `directional` context (if available)
 - `detections`:
   - `objects` (label, confidence, bbox)
   - `metrics` (`num_detections`, `avg_confidence`, `max_confidence`, `min_confidence`)

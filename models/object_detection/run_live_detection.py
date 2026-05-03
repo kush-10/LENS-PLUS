@@ -17,6 +17,9 @@ from ultralytics import YOLO
 BASE_DIR     = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[1]
 APP_DIR      = PROJECT_ROOT / "api" / "app"
+sys.path.insert(0, str(APP_DIR))
+
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 OUTPUT_DIR   = BASE_DIR / "output"
 OUTPUT_WIDTH  = 640
@@ -69,12 +72,13 @@ class ObjectDetector:
         self.target_fps  = target_fps
         self.conf        = conf
         self.write_video = write_video
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.yolo_device = 0 if self.device == "cuda" else "cpu"
+        self.device      = select_torch_device(component_env_var="LENS_DETECTION_DEVICE")
+        self.yolo_device = yolo_device_from_torch_device(self.device)
 
         print(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
-        print(f"Model loaded. Object detection device: {self.device}")
+        self.model.to(self.device)
+        print(f"Model loaded. ObjectDetector using device: {self.device}")
 
     def find_latest_artifact(self) -> Path:
         artifacts = [p for p in self.frames_root.iterdir() if p.is_dir()]

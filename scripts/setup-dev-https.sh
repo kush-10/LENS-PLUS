@@ -61,11 +61,30 @@ detect_ip() {
 }
 
 LAN_IP="${1:-$(detect_ip)}"
+MODE="${2:-local}"
 if [ -z "$LAN_IP" ]; then
   printf "Could not auto-detect LAN IP.\n"
   printf "Run again with your LAN IP: scripts/setup-dev-https.sh 192.168.1.42\n"
   exit 1
 fi
+
+case "$MODE" in
+  local)
+    ENV_KEY_FILE="web/certs/dev-key.pem"
+    ENV_CERT_FILE="web/certs/dev-cert.pem"
+    ENV_API_TARGET="http://localhost:8000"
+    ;;
+  docker|--docker)
+    ENV_KEY_FILE="/app/certs/dev-key.pem"
+    ENV_CERT_FILE="/app/certs/dev-cert.pem"
+    ENV_API_TARGET="http://api:8000"
+    ;;
+  *)
+    printf "Unknown mode: %s\n" "$MODE"
+    printf "Use: scripts/setup-dev-https.sh [ip] [local|docker]\n"
+    exit 1
+    ;;
+esac
 
 mkdir -p "$CERT_DIR"
 
@@ -85,12 +104,16 @@ printf "Installing local CA (mkcert -install)...\n"
 "$MKCERT_BIN" -install
 
 printf "Generating cert for localhost + %s...\n" "$LAN_IP"
-mkcert \
+"$MKCERT_BIN" \
   -key-file "$KEY_FILE" \
   -cert-file "$CERT_FILE" \
   localhost 127.0.0.1 ::1 "$LAN_IP"
 
+ENV_KEY_FILE="$ENV_KEY_FILE" \
+ENV_CERT_FILE="$ENV_CERT_FILE" \
+ENV_API_TARGET="$ENV_API_TARGET" \
 python3 - "$ENV_FILE" <<'PY'
+import os
 from pathlib import Path
 import sys
 
@@ -105,10 +128,10 @@ if env_path.exists():
         existing[key.strip()] = value.strip()
 
 existing["DEV_HTTPS"] = "true"
-existing["DEV_HTTPS_KEY_FILE"] = "/app/certs/dev-key.pem"
-existing["DEV_HTTPS_CERT_FILE"] = "/app/certs/dev-cert.pem"
+existing["DEV_HTTPS_KEY_FILE"] = os.environ["ENV_KEY_FILE"]
+existing["DEV_HTTPS_CERT_FILE"] = os.environ["ENV_CERT_FILE"]
 existing["VITE_SIGNALING_BASE_URL"] = "/api"
-existing.setdefault("VITE_API_PROXY_TARGET", "http://api:8000")
+existing["VITE_API_PROXY_TARGET"] = os.environ["ENV_API_TARGET"]
 
 ordered_keys = [
     "VITE_SIGNALING_BASE_URL",
@@ -131,6 +154,12 @@ printf -- "- Cert: %s\n" "$CERT_FILE"
 printf -- "- Key:  %s\n" "$KEY_FILE"
 printf -- "- LAN URL: https://%s:5173\n" "$LAN_IP"
 printf "\nNext steps:\n"
-printf "1) docker compose down\n"
-printf "2) docker compose up --build\n"
-printf "3) Confirm Vite logs show https:// URLs\n"
+if [ "$MODE" = "local" ]; then
+  printf "1) Start the API: source venv/bin/activate && python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload\n"
+  printf "2) Start the web app: cd web && npm run dev -- --host 0.0.0.0 --port 5173\n"
+  printf "3) Open https://%s:5173 and confirm Vite logs show https:// URLs\n" "$LAN_IP"
+else
+  printf "1) docker compose down\n"
+  printf "2) docker compose up --build\n"
+  printf "3) Confirm Vite logs show https:// URLs\n"
+fi

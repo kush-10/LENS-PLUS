@@ -20,7 +20,9 @@ if not DEEPLAB_NETWORK_PATH.exists():
         "Clone https://github.com/VainF/DeepLabV3Plus-Pytorch into "
         f"{DEEPLAB_PATH}."
     )
+APP_DIR = PROJECT_ROOT / "api" / "app"
 sys.path.insert(0, str(DEEPLAB_PATH))
+sys.path.insert(0, str(APP_DIR))
 
 import cv2
 import numpy as np
@@ -34,8 +36,7 @@ if not hasattr(network, "modeling"):
         f"Expected local module under {DEEPLAB_NETWORK_PATH}. "
         "Check your PYTHONPATH and DeepLab checkout."
     )
- 
-APP_DIR = PROJECT_ROOT / "api" / "app"
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation" / "output"
 
@@ -139,8 +140,8 @@ class ImprovedSegmentation:
         self.target_fps = target_fps
         self.use_yolo = use_yolo
         self.deeplab_every_n_frames = deeplab_every_n_frames
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.yolo_device = 0 if self.device == "cuda" else "cpu"
+        self.device = select_torch_device(component_env_var="LENS_SEGMENTATION_DEVICE")
+        self.yolo_device = yolo_device_from_torch_device(self.device)
         print(f"Segmentation using device: {self.device}")
 
         self.mapper = CityscapesAccessibilityMapper()
@@ -149,6 +150,8 @@ class ImprovedSegmentation:
         self.prev_hazard_mask = None
 
         self.yolo_model = YOLO(yolo_model_path) if use_yolo else None
+        if self.yolo_model is not None:
+            self.yolo_model.to(self.device)
         self.deeplab_model = self.load_deeplab(deeplab_model_path)
 
         self.transform = transforms.Compose(
@@ -364,7 +367,7 @@ class ImprovedSegmentation:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.deeplab_model(tensor)
 
         preds = outputs.max(1)[1].cpu().numpy()[0]

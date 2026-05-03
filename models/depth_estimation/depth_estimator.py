@@ -20,9 +20,12 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "api", "app"))
+sys.path.insert(0, APP_DIR)
 DEPTH_ANYTHING_PATH = os.path.join(BASE_DIR, "Depth-Anything-V2", "metric_depth")
 sys.path.insert(0, DEPTH_ANYTHING_PATH)
 
+from compute_device import select_torch_device
 from depth_anything_v2.dpt import DepthAnythingV2
 
 from object_distance import (
@@ -187,11 +190,7 @@ class DepthEstimator:
 
         self.prev_depth = None
 
-        self.device = (
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        self.device = select_torch_device(component_env_var="LENS_DEPTH_DEVICE")
         print(f"DepthEstimator using device: {self.device}")
 
         self.model = self._load_model()
@@ -330,7 +329,7 @@ class DepthEstimator:
 
     def get_depth_predictions(self, frame: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
+        with torch.inference_mode():
             depth = self.model.infer_image(rgb)
         return depth
 

@@ -12,7 +12,7 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
   - Camera source (`getUserMedia`) for phone testing
   - Video file source for desktop dev testing
   - WebRTC connect/disconnect flow
-  - Directional telemetry UI, voice-question recording, answer text, and audio playback
+  - Voice-question recording, answer text, and audio playback
   - Overlay canvas scaffold for detection boxes
 - `api/` (FastAPI + aiortc)
   - `POST /webrtc/offer`
@@ -22,7 +22,7 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
   - `GET /debug/sessions/history`
   - `GET /debug/sessions/{session_id}/latest.jpg`
   - Per-session frame dump artifacts in `api/app/session_artifacts/`
-  - Typed data-channel messages for directional sensor telemetry and `question_text`
+  - Typed data-channel messages for `question_text`
   - Assistant pipeline: summarized frame-window context + SmolVLM + local Ollama/Qwen + local TTS
 - `model-pipeline` (Docker Compose service)
   - Runs `models/start_pipeline.py --no-video`
@@ -106,6 +106,11 @@ OLLAMA_MODEL=qwen2.5:7b-instruct
 OLLAMA_TIMEOUT_SECONDS=60
 OLLAMA_NUM_PREDICT=180
 ENABLE_LLM_PROMPT_AUDIT=true
+LENS_COMPUTE_DEVICE=auto
+LENS_VLM_DEVICE=
+LENS_DETECTION_DEVICE=
+LENS_SEGMENTATION_DEVICE=
+LENS_DEPTH_DEVICE=
 SMOLVLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
 SMOLVLM_MAX_NEW_TOKENS=120
 SMOLVLM_NUM_BEAMS=1
@@ -120,6 +125,10 @@ These defaults target Docker Compose. For a fully local no-Docker run, use `VITE
 `OLLAMA_BASE_URL` points the API container at Ollama running on the host machine. With Docker Compose, `http://host.docker.internal:11434` is the expected value. Ensure the configured `OLLAMA_MODEL` is pulled locally, for example `ollama pull qwen2.5:7b-instruct`.
 
 `ENABLE_LLM_PROMPT_AUDIT=true` writes the full raw Ollama/Qwen prompt and answer audit under each session artifact in `question-audits/`.
+
+`LENS_COMPUTE_DEVICE=auto` makes local torch/Ultralytics inference prefer CUDA, then Apple MPS, then CPU. Override globally with `cpu`, `cuda`, `cuda:0`, or `mps`. Component-specific overrides are available with `LENS_VLM_DEVICE`, `LENS_DETECTION_DEVICE`, `LENS_SEGMENTATION_DEVICE`, and `LENS_DEPTH_DEVICE`; leave them empty to inherit `LENS_COMPUTE_DEVICE`.
+
+The Docker workflow does not use local GPU acceleration. Use the local no-Docker workflow below for Apple MPS or local NVIDIA CUDA.
 
 Local TTS uses macOS `say` or Linux `espeak-ng`, then encodes MP3 with `ffmpeg`. The API Docker image installs `espeak-ng` and `ffmpeg`.
 
@@ -172,12 +181,57 @@ http://localhost:8000/health
 ### Backend
 
 ```bash
-cd api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r api/requirements.txt torchvision matplotlib
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
 ```
+
+### Model Pipeline
+
+Run the model pipeline from a second terminal after the backend is running:
+
+```bash
+source venv/bin/activate
+python models/start_pipeline.py --no-video
+```
+
+### Local GPU
+
+Apple Silicon MPS:
+
+```bash
+source venv/bin/activate
+export LENS_COMPUTE_DEVICE=mps
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
+```
+
+In a second terminal:
+
+```bash
+source venv/bin/activate
+export LENS_COMPUTE_DEVICE=mps
+python models/start_pipeline.py --no-video
+```
+
+NVIDIA CUDA, local non-Docker:
+
+```bash
+source venv/bin/activate
+export LENS_COMPUTE_DEVICE=cuda
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')"
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
+```
+
+In a second terminal:
+
+```bash
+source venv/bin/activate
+export LENS_COMPUTE_DEVICE=cuda
+python models/start_pipeline.py --no-video
+```
+
+If CUDA prints `False`, install a CUDA-enabled PyTorch build for your platform from the official PyTorch install selector, then rerun the check. Use `LENS_COMPUTE_DEVICE=cuda:0` to target a specific GPU.
 
 ### Frontend
 
@@ -205,25 +259,27 @@ Fast path (auto setup):
 scripts/setup-dev-https.sh
 ```
 
-If IP auto-detect fails:
+If IP auto-detect fails, or if you are opening the app through a Tailscale/LAN IP, pass that IP explicitly:
 
 ```bash
-scripts/setup-dev-https.sh 192.168.1.42
+scripts/setup-dev-https.sh 100.119.33.58
 ```
 
 The script:
 
 - installs/trusts mkcert local CA
 - creates `web/certs/dev-cert.pem` and `web/certs/dev-key.pem`
-- updates `.env` with Docker-compatible HTTPS vars
+- updates `.env` with local no-Docker HTTPS vars
 - sets signaling to `/api` to avoid HTTPS mixed-content errors
 
-Then restart services:
+Then restart the local frontend:
 
 ```bash
-docker compose down
-docker compose up --build
+cd web
+npm run dev -- --host 0.0.0.0 --port 5173
 ```
+
+Keep the local API running on `http://localhost:8000`; Vite proxies `/api` to it.
 
 Open from phone:
 
@@ -238,6 +294,7 @@ If your phone still shows trust warnings, install/trust the mkcert local CA on t
 - Vite startup output should show `https://` URLs.
 - If it still shows `http://`, `DEV_HTTPS` vars were not loaded.
 - With HTTPS enabled, signaling should go to `/api/...` (Vite proxy), not `http://localhost:8000/...`.
+- If Safari cannot establish a secure connection, stop and restart `npm run dev` after generating certs.
 
 ## Signaling API contract
 

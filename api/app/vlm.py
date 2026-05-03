@@ -9,6 +9,8 @@ from typing import Any
 
 from PIL import Image
 
+from .compute_device import select_torch_device
+
 
 SMOLVLM_MODEL_ID = os.getenv(
     "SMOLVLM_MODEL_ID", "HuggingFaceTB/SmolVLM-256M-Instruct"
@@ -43,8 +45,8 @@ def get_smolvlm_components() -> tuple[Any, Any, str]:
                     "SmolVLM dependencies are unavailable. Install torch and transformers."
                 ) from error
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if device == "cuda" else torch.float32
+            device = select_torch_device(component_env_var="LENS_VLM_DEVICE", logger=logger)
+            dtype = torch.float16 if device.startswith("cuda") else torch.float32
             logger.info(
                 "Loading SmolVLM model_id=%s device=%s dtype=%s",
                 SMOLVLM_MODEL_ID,
@@ -69,10 +71,14 @@ def get_smolvlm_components() -> tuple[Any, Any, str]:
 
 
 def _model_device() -> str:
-    try:
-        import torch
+    if _smolvlm_model is not None:
+        try:
+            return str(next(_smolvlm_model.parameters()).device)
+        except Exception:
+            pass
 
-        return "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        return select_torch_device(component_env_var="LENS_VLM_DEVICE", logger=logger)
     except Exception:
         return "cpu"
 

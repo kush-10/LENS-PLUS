@@ -18,7 +18,6 @@ def build_scene_context(
     artifact_dir: Path | None,
     latest_jpeg_at: datetime | None,
     latest_frame_at: datetime | None,
-    latest_directional_context: dict[str, Any] | None,
     latest_detection_context: dict[str, Any] | None,
     after_frame_index: int | None = None,
     max_frame_index: int | None = None,
@@ -30,7 +29,6 @@ def build_scene_context(
             "latest_jpeg_at": latest_jpeg_at.isoformat() if latest_jpeg_at else None,
             "latest_frame_at": latest_frame_at.isoformat() if latest_frame_at else None,
         },
-        "directional": latest_directional_context,
         "live_detections": latest_detection_context,
         "artifact": None,
         "frame_window": empty_frame_window(

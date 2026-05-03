@@ -1,31 +1,39 @@
+# OS files
 .DS_Store
+
+# Environment files
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-api/.venv/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
 venv/
 
-# Node
+# Logs
+*.log
+
+# Node / Vite
 node_modules/
-web/node_modules/
 web/dist/
 web/certs/
 
 # Runtime artifacts
 api/app/session_artifacts/
+models/**/output/
 
-yolov8n-seg.pt
+# Model weights and generated model assets
 yolo11s.pt
+yolov8n-seg.pt
 models/object_detection/yolov8n.pt
 models/depth_estimation/checkpoints/*.pth
 models/segmentation/src/DeepLabV3Plus-Pytorch/
-models/segmentation/src/python
-models/segmentation/output/improved_segmented_video.mp4
-
-models\segmentation\src\deeplabv3plus_mobilenet_finetuned.pth
 models/segmentation/src/deeplabv3plus_mobilenet_finetuned.pth
+models/segmentation/src/python
