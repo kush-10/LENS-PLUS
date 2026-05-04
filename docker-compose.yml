@@ -1,4 +1,18 @@
 services:
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+      args:
+        OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b-instruct}
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:1.5b-instruct}
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
   api:
     build:
       context: ./api
@@ -9,11 +23,16 @@ services:
       - SNAPSHOT_JPEG_QUALITY=${SNAPSHOT_JPEG_QUALITY:-92}
       - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
       - ENABLE_MOCK_RESULTS=${ENABLE_MOCK_RESULTS:-false}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:1.5b-instruct}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-60}
       - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-180}
       - ENABLE_LLM_PROMPT_AUDIT=${ENABLE_LLM_PROMPT_AUDIT:-true}
+      - LENS_COMPUTE_DEVICE=${LENS_COMPUTE_DEVICE:-auto}
+      - LENS_VLM_DEVICE=${LENS_VLM_DEVICE:-}
+      - LENS_DETECTION_DEVICE=${LENS_DETECTION_DEVICE:-}
+      - LENS_SEGMENTATION_DEVICE=${LENS_SEGMENTATION_DEVICE:-}
+      - LENS_DEPTH_DEVICE=${LENS_DEPTH_DEVICE:-}
       - SMOLVLM_MODEL_ID=${SMOLVLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
       - SMOLVLM_MAX_NEW_TOKENS=${SMOLVLM_MAX_NEW_TOKENS:-120}
       - SMOLVLM_NUM_BEAMS=${SMOLVLM_NUM_BEAMS:-1}
@@ -28,6 +47,9 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    depends_on:
+      ollama:
+        condition: service_healthy
 
   model-pipeline:
     build:
@@ -37,6 +59,10 @@ services:
       - PYTHONUNBUFFERED=1
       - MPLBACKEND=Agg
       - YOLO_CONFIG_DIR=/tmp/ultralytics
+      - LENS_COMPUTE_DEVICE=${LENS_COMPUTE_DEVICE:-auto}
+      - LENS_DETECTION_DEVICE=${LENS_DETECTION_DEVICE:-}
+      - LENS_SEGMENTATION_DEVICE=${LENS_SEGMENTATION_DEVICE:-}
+      - LENS_DEPTH_DEVICE=${LENS_DEPTH_DEVICE:-}
     volumes:
       - ./api/app/session_artifacts:/app/api/app/session_artifacts
     depends_on:
@@ -62,3 +88,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
+
+volumes:
+  ollama-data:

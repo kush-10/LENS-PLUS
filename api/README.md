@@ -2,30 +2,15 @@
 
 This service handles WebRTC signaling, receives camera frames, throttles analysis to a fixed FPS, stores grouped artifacts, and answers voice-question transcripts over a WebRTC data channel.
 
-It is intentionally lightweight so you can swap in a real model pipeline with minimal changes.
+Core implementation is in `app/main.py`.
 
-## What this API does
-
-- Accepts SDP offer/answer exchange (`POST /webrtc/offer`)
-- Accepts trickle ICE candidates (`POST /webrtc/ice`)
-- Tracks active sessions and frame counters (`GET /debug/sessions`)
-- Returns persisted session dump history (`GET /debug/sessions/history`)
-- Exposes latest JPEG snapshot per session (`GET /debug/sessions/{session_id}/latest.jpg`)
-- Writes all processed session frames to disk (`api/app/session_artifacts/` by default)
-- Reads model sidecars written beside those frames by the Docker `model-pipeline` service
-- Receives voice-question transcripts using `question_text`
-- Builds answer context by summarizing frame metadata plus `.detections.json` and `.navigation.json` sidecars since the previous answer
-- Uses SmolVLM, local Ollama/Qwen, and local TTS for answer text and optional MP3 audio
-
-Core implementation is in `api/app/main.py`.
-
-## Run locally
+## Run Locally
 
 ```bash
-python3.12 -m venv venv
-source venv/bin/activate
-pip install -r api/requirements.txt torchvision matplotlib
-python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
+python3.12 -m venv ../venv
+source ../venv/bin/activate
+pip install -r requirements.txt torchvision matplotlib
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Health check:
@@ -34,373 +19,33 @@ Health check:
 http://localhost:8000/health
 ```
 
-## Environment variables
+For full Mac, Windows, Docker, Ollama, and GPU setup, use the root README and docs.
 
-- `ANALYSIS_TARGET_FPS` (default: `15`)
-  - Controls server-side frame processing rate.
-  - This is the only source of truth for analysis cadence.
-  - Value is clamped to `1..30`.
-- `SESSION_ARTIFACTS_DIR` (optional)
-  - Directory where per-session frame dumps are written.
-  - Defaults to `api/app/session_artifacts` in local runs and `/app/app/session_artifacts` in Docker.
-- `ENABLE_MOCK_RESULTS` (default: `false`)
-  - Enables legacy mock inference ticks on the data channel for scaffold testing.
-- `OLLAMA_BASE_URL` (default for Docker: `http://host.docker.internal:11434`)
-  - Base URL for Ollama running on the host machine.
-- `OLLAMA_MODEL` (default: `qwen2.5:7b-instruct`)
-  - Local Ollama model used for final answer composition.
-- `OLLAMA_TIMEOUT_SECONDS` and `OLLAMA_NUM_PREDICT`
-  - Ollama request timeout and response length controls.
-- `ENABLE_LLM_PROMPT_AUDIT` (default: `true`)
-  - Writes full raw Ollama/Qwen prompt and answer audits under each session artifact in `question-audits/`.
-- `LENS_COMPUTE_DEVICE` (default: `auto`)
-  - Selects torch/Ultralytics inference device. `auto` prefers CUDA, then Apple MPS, then CPU.
-  - Supported explicit values include `cpu`, `cuda`, `cuda:0`, and `mps`.
-- `LENS_VLM_DEVICE`, `LENS_DETECTION_DEVICE`, `LENS_SEGMENTATION_DEVICE`, `LENS_DEPTH_DEVICE`
-  - Optional per-component overrides. Leave empty to inherit `LENS_COMPUTE_DEVICE`.
-- `SMOLVLM_MODEL_ID` (default: `HuggingFaceTB/SmolVLM-256M-Instruct`)
-  - Hugging Face model id for local visual-language analysis.
-- `SMOLVLM_MAX_NEW_TOKENS` and `SMOLVLM_NUM_BEAMS`
-  - SmolVLM generation controls.
+## API Docs
 
-Examples:
+| Topic | Link |
+| --- | --- |
+| API contract, frame processing, and data channel | [`../docs/api.md`](../docs/api.md) |
+| Environment variables | [`../docs/environment.md`](../docs/environment.md) |
+| Local development commands | [`../docs/local-development.md`](../docs/local-development.md) |
+| Model pipeline sidecars | [`../docs/model-pipeline.md`](../docs/model-pipeline.md) |
+| Session artifacts and cleanup | [`../docs/session-artifacts.md`](../docs/session-artifacts.md) |
+| Testing and evaluation | [`../docs/testing-and-evaluation.md`](../docs/testing-and-evaluation.md) |
+
+## Key Defaults
+
+| Variable | Local default | Docker Compose value |
+| --- | --- | --- |
+| `ANALYSIS_TARGET_FPS` | `15` | `${ANALYSIS_TARGET_FPS:-15}` |
+| `SESSION_ARTIFACTS_DIR` | `app/session_artifacts` | `/app/app/session_artifacts` |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | `http://ollama:11434` |
+| `OLLAMA_MODEL` | `qwen2.5:1.5b-instruct` | `${OLLAMA_MODEL:-qwen2.5:1.5b-instruct}` |
+| `LENS_COMPUTE_DEVICE` | `auto` | `${LENS_COMPUTE_DEVICE:-auto}` |
+
+Local TTS uses macOS `say` or Linux `espeak-ng`, then encodes MP3 with `ffmpeg`. The API Dockerfile installs `espeak-ng` and `ffmpeg`.
+
+Run tests from this directory:
 
 ```bash
-ANALYSIS_TARGET_FPS=15 python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
-```
-
-Local TTS requires macOS `say` or Linux `espeak-ng`, plus `ffmpeg` for MP3 encoding. The API Dockerfile installs `espeak-ng` and `ffmpeg`.
-
-For local no-Docker GPU use, set `LENS_COMPUTE_DEVICE=mps` on Apple Silicon or `LENS_COMPUTE_DEVICE=cuda` on an NVIDIA CUDA machine before starting the API and `models/start_pipeline.py`.
-
-With Docker Compose (root `docker-compose.yml`), `ANALYSIS_TARGET_FPS` is passed into the `api` container via:
-
-```yaml
-ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
-```
-
-## Evaluation and tests
-
-The evaluation helpers live here:
-
-- `app/evaluation/iou.py`
-- `app/evaluation/detection_metrics.py`
-- `app/evaluation/segmentation_metrics.py`
-
-To run the full test suite:
-
-```bash
-cd api
 python -m unittest discover -s tests -v
 ```
-
-The tests cover:
-
-- IoU math (`xyxy` and `xywh`)
-- precision / recall / F1 at IoU thresholds
-- class-aware and class-agnostic matching
-- per-class metrics and confusion matrix
-- `mAP@0.5` and `mAP@0.5:0.95`
-- segmentation metrics (`Dice`, pixel accuracy, mask IoU, multiclass mIoU)
-- API integration and common failure paths
-
-If you want to run the benchmark/evaluation scripts, install the extra deps:
-
-```bash
-cd api
-pip install -r requirements-dev.txt
-```
-
-### Detection report (IoU/F1/mAP/per-class/confusion)
-
-Sample input: `examples/detection_eval_sample.json`
-
-```bash
-cd api
-python scripts/run_detection_eval.py --input examples/detection_eval_sample.json
-```
-
-Save report:
-
-```bash
-python scripts/run_detection_eval.py --input examples/detection_eval_sample.json --output reports/detection_metrics.json
-```
-
-### Segmentation report (Dice / Pixel Accuracy / mIoU)
-
-Sample input: `examples/segmentation_eval_sample.json`
-
-```bash
-cd api
-python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json
-```
-
-Save report:
-
-```bash
-python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json --output reports/segmentation_metrics.json
-```
-
-### Latency and FPS benchmark
-
-```bash
-cd api
-python scripts/run_latency_benchmark.py --model ../yolo11n.pt --source 0 --frames 120 --warmup 20
-```
-
-`--source` examples:
-
-- webcam: `0`
-- video file: `../some_clip.mp4`
-- backend snapshot URL: `http://localhost:8000/debug/sessions/<session_id>/latest.jpg`
-
-### Robustness evaluation (blur / brightness / contrast / jpeg artifacts / noise)
-
-Input JSON format:
-
-```json
-{
-  "images": [
-    {
-      "image_id": "img-001",
-      "path": "C:/path/to/image.jpg",
-      "ground_truths": [
-        { "label": "person", "bbox": [10, 20, 130, 260] }
-      ]
-    }
-  ]
-}
-```
-
-Run:
-
-```bash
-cd api
-python scripts/run_robustness_eval.py --model ../yolo11n.pt --input C:/path/to/robustness_dataset.json --output reports/robustness_report.json
-```
-
-### Regression check
-
-Compare current metrics with a baseline:
-
-```bash
-cd api
-python scripts/run_regression_check.py --baseline reports/baseline_detection_metrics.json --current reports/current_detection_metrics.json --max-map50-drop 0.02 --max-map5095-drop 0.02
-```
-
-Set minimum required thresholds:
-
-```bash
-python scripts/run_regression_check.py --current reports/current_detection_metrics.json --min-map50 0.40 --min-map5095 0.20
-```
-
-### API integration and failure-path tests
-
-`tests/test_api_integration.py` checks:
-
-- `/health`
-- `/debug/sessions`
-- `/debug/sessions/history`
-- unknown session snapshot returns `404`
-- no-snapshot-yet returns `404`
-- unknown ICE session returns `404`
-- malformed offer payload returns `422`
-
-## API contract
-
-### `POST /webrtc/offer`
-
-Request:
-
-```json
-{
-  "sdp": "...",
-  "type": "offer",
-  "session_id": "optional"
-}
-```
-
-Response:
-
-```json
-{
-  "sdp": "...",
-  "type": "answer",
-  "session_id": "uuid"
-}
-```
-
-### `POST /webrtc/ice`
-
-Request:
-
-```json
-{
-  "session_id": "uuid",
-  "candidate": "candidate:...",
-  "sdpMid": "0",
-  "sdpMLineIndex": 0
-}
-```
-
-Response:
-
-```json
-{
-  "ok": true
-}
-```
-
-### `GET /debug/sessions`
-
-Returns per-session diagnostics, including:
-
-- `analysis_target_fps`
-- `incoming_fps`
-- `processed_fps`
-- `total_frames`
-- `processed_frames`
-- `dropped_frames`
-- snapshot metadata and connection state
-
-### `GET /debug/sessions/{session_id}/latest.jpg`
-
-Returns latest JPEG created from incoming video track.
-
-### `GET /debug/sessions/history`
-
-Returns persisted session artifact metadata (`session.json`) for recent sessions.
-
-## How frame processing works today
-
-In `api/app/main.py`, each video frame is received in `consume_frames()`.
-
-- Incoming rate is tracked as `incoming_fps`.
-- Processing is throttled by `analysis_target_fps` using monotonic timing.
-- Frames skipped by throttling increment `dropped_frames`.
-- Processed frames increment `processed_frames`.
-- Each processed frame is saved as a JPEG dump in that session's artifact directory.
-- A snapshot JPEG is periodically saved for debug preview.
-
-Every session creates:
-
-- `frame-*.jpg` files for each processed frame
-- `frame-*.json` metadata for each processed frame
-- `session.json` metadata with counters, timestamps, dump status, and latest detection state
-
-`frame-*.json` includes:
-
-- `frame_id` / `frame_index`
-- `frame_at`
-- `detections`:
-  - `objects` (label, confidence, bbox)
-  - `metrics` (`num_detections`, `avg_confidence`, `max_confidence`, `min_confidence`)
-  - inference timestamp and staleness (`age_ms`, `is_stale`)
-
-`app/session_artifacts/` is ignored by git and excluded from Docker build context.
-
-To clear artifacts:
-
-```bash
-../scripts/clean-session-artifacts.sh
-```
-
-This gives you backpressure control before a real model is attached.
-
-## Voice Assistant Data Channel
-
-The frontend sends a text transcript after browser SpeechRecognition stops:
-
-```json
-{
-  "type": "question_text",
-  "text": "What is in front of me?"
-}
-```
-
-The backend sends status events while the pipeline runs:
-
-```json
-{
-  "type": "status",
-  "status": "running_llm",
-  "message": "Composing a navigation answer."
-}
-```
-
-The final answer includes text and, when local TTS succeeds, MP3 audio as base64:
-
-```json
-{
-  "type": "answer",
-  "transcript": "What is in front of me?",
-  "answer": "There is a chair ahead; move slightly left if you need to pass.",
-  "audio_base64": "..."
-}
-```
-
-If structured model sidecars, SmolVLM, the LLM, or TTS fail, the backend still returns the best available text answer and includes `audio_error` when only speech generation fails.
-
-## Linking this to the model pipeline
-
-Docker Compose starts a separate `model-pipeline` service that runs `models/start_pipeline.py --no-video`. The API and model service share `api/app/session_artifacts/`.
-
-The integration flow is:
-
-1. The API samples WebRTC frames and writes grouped `frame-*.jpg` artifacts.
-2. The model pipeline watches completed groups and writes sidecars next to those frames.
-3. Object detection writes `frame-*.detections.json`.
-4. Segmentation and depth write `frame-*.navigation.json`.
-5. On `question_text`, the API queries SmolVLM with the latest frame while waiting for the latest fully processed group that ended before the question time.
-6. A group is ready only when every frame in it has object detection, segmentation, and depth sidecars.
-7. If no prior group exists, or if the selected group is still incomplete after `MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS`, the API answers with VLM-only context and marks structured context as not ready.
-8. The API sends structured context plus VLM text to Ollama/Qwen, then returns text and TTS audio over the data channel.
-
-The old `send_mock_results()` path remains available only when `ENABLE_MOCK_RESULTS=true`.
-
-If you later want live detection overlays in the browser, map model predictions to the frontend message shape and send serialized JSON over `session.data_channel`.
-
-Expected message shape (consumed by web client):
-
-```json
-{
-  "timestamp": "2026-04-02T18:29:21.234Z",
-  "guidance_text": "Caution: person ahead.",
-  "scene_summary": "Detected one person near the center.",
-  "objects": [
-    {
-      "label": "person",
-      "confidence": 0.91,
-      "bbox": [0.31, 0.22, 0.22, 0.44]
-    }
-  ]
-}
-```
-
-`bbox` is normalized `[x, y, width, height]` in `0..1` coordinates.
-
-## Minimal integration sketch
-
-Below is a high-level pattern (not drop-in complete code):
-
-```python
-loop = asyncio.get_running_loop()
-result = await loop.run_in_executor(None, model.predict, model_input)
-
-payload = {
-    "timestamp": datetime.now(timezone.utc).isoformat(),
-    "guidance_text": build_guidance(result),
-    "scene_summary": summarize_scene(result),
-    "objects": to_objects(result),
-}
-
-if session.data_channel and getattr(session.data_channel, "readyState", "") == "open":
-    session.data_channel.send(json.dumps(payload))
-```
-
-## Production notes
-
-- Keep model load as a singleton per process to avoid repeated warmup.
-- Avoid blocking `track.recv()` with expensive inference on the main event loop.
-- If inference is slower than configured FPS, keep dropping frames rather than queueing unbounded work.
-- Consider moving model execution to a separate worker service once load grows.

@@ -5,6 +5,9 @@
 .env
 .env.*
 !.env.example
+!.env.mac.example
+!.env.windows.example
+!.env.nvidia.example
 
 # Python
 __pycache__/
