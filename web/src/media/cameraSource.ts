@@ -11,10 +11,9 @@ export async function startCameraStream(targetFramerate = 15): Promise<MediaStre
     throw new Error("getUserMedia is not available in this browser.");
   }
 
-  const viewportIsPortrait = window.matchMedia("(orientation: portrait)").matches;
-  const idealWidth = viewportIsPortrait ? 1080 : 1920;
-  const idealHeight = viewportIsPortrait ? 1920 : 1080;
-  const idealAspectRatio = viewportIsPortrait ? 9 / 16 : 16 / 9;
+  const idealWidth = 1920;
+  const idealHeight = 1080;
+  const idealAspectRatio = 16 / 9;
 
   const videoConstraints: MediaTrackConstraints = {
     facingMode: { ideal: "environment" },

@@ -10,6 +10,7 @@ OBJ_DETECTION_SCRIPT = BASE_DIR / "object_detection" / "run_live_detection.py"
 SEGMENTATION_SCRIPT = BASE_DIR / "segmentation" / "src" / "segmentation-live-feed.py"
 DEPTH_SCRIPT = BASE_DIR / "depth_estimation" / "depth_estimator.py"
 SUMMARY_SCRIPT = BASE_DIR / "metrics_summary" / "run_group_pair_summary.py"
+LLM_SUMMARY_SCRIPT = BASE_DIR / "metrics_summary" / "run_llm_question_summary.py"
 
 def launch_process(script_path: Path, extra_args: list[str] | None = None) -> subprocess.Popen:
     args = [sys.executable, str(script_path)]
@@ -23,6 +24,11 @@ def main():
         "--no-video",
         action="store_true",
         help="Skip mp4 writing in all scripts",
+    )
+    parser.add_argument(
+        "--exit-on-child-failure",
+        action="store_true",
+        help="Stop the pipeline if any child model process exits",
     )
     args = parser.parse_args()
 
@@ -40,6 +46,7 @@ def main():
         "Segmentation": (SEGMENTATION_SCRIPT, extra_args),
         "Depth Estimation": (DEPTH_SCRIPT, extra_args),
         "Metrics Summary": (SUMMARY_SCRIPT, []),
+        "LLM Question Summary": (LLM_SUMMARY_SCRIPT, ["--watch"]),
     }
 
     processes: dict[str, subprocess.Popen] = {}
@@ -57,6 +64,8 @@ def main():
                 if process.poll() is None:
                     continue
                 code = process.returncode
+                if args.exit_on_child_failure:
+                    raise RuntimeError(f"{name} stopped unexpectedly (exit {code})")
                 print(f"WARN: {name} stopped unexpectedly (exit {code}). Restarting...")
                 script_path, script_args = process_specs[name]
                 processes[name] = launch_process(script_path, script_args)
@@ -69,6 +78,15 @@ def main():
         for process in processes.values():
             process.wait()
         print("Shutdown complete.")
+    except RuntimeError as error:
+        print(f"Pipeline failed: {error}")
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+
+        for process in processes.values():
+            process.wait()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

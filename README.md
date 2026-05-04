@@ -2,129 +2,95 @@
 
 Local Environmental Navigation Support +
 
-LENS-PLUS is a navigational system for visually impaired users that aims to improve perception of diverse environments with technology such as object detection, semantic segmentation, depth estimation natural language scene generation and live streaming.
+LENS-PLUS streams video from a phone or desktop browser to a FastAPI backend, writes frame artifacts, runs local vision models, and answers navigation questions with SmolVLM, Ollama/Qwen, and local TTS.
 
-A WebRTC prototype streams video from a phone or desktop browser to a FastAPI backend. The backend returns mock guidance events over a WebRTC data channel and exposes debug endpoints to verify frame intake.
+## Before You Run
 
-## What is implemented
+Download and place the required model files first. The Docker `model-pipeline` build fails if they are missing.
 
-- `web/` (Vite + TypeScript)
-  - Camera source (`getUserMedia`) for phone testing
-  - Video file source for desktop dev testing
-  - WebRTC connect/disconnect flow
-  - Data-channel event log and optional TTS
-  - Overlay canvas scaffold for detection boxes
-- `api/` (FastAPI + aiortc)
-  - `POST /webrtc/offer`
-  - `POST /webrtc/ice`
-  - `GET /health`
-  - `GET /debug/sessions`
-  - `GET /debug/sessions/history`
-  - `GET /debug/sessions/{session_id}/latest.jpg`
-  - Per-session frame dump artifacts in `api/app/session_artifacts/`
-  - Mock inference events streamed over WebRTC data channel `results`
+See [Model Files](docs/model-files.md) for the Dropbox link and exact paths.
 
-## Repository layout
+## Install Docker
 
-- `web/` frontend app
-- `api/` backend signaling service
-- `api/README.md` backend details + model integration guide
-- `scripts/setup-dev-https.sh` local HTTPS helper for phone camera testing
-- `docker-compose.yml` shared dev setup
-
-## Prerequisites
-
-- Docker Desktop (for Docker workflow)
-- Python 3.11+ and `pip` (for local backend workflow)
-- Node.js 18+ and npm (for local frontend workflow)
-- `mkcert` (optional, but recommended for real phone camera testing)
-
-## Model Files Setup
-
-Before running the backend, you need to download the required model files:
-
-1. **Download models from Dropbox:**
-   
-   Access the model files here: [LENS-PLUS Dropbox](https://www.dropbox.com/scl/fo/e7wcpej7kzxjdm7qqyulo/AN6OHj5xWruEfk5qEqyan6s?rlkey=gg16nhb58a7rfd0rdv9j75e6p&st=kw2e3fbt&dl=0)
-
-2. **Place the models in the correct directories:**
-
-   - `deeplabv3plus_mobilenet_finetuned.pth`
-     - Place in: `models/segmentation/src/`
-   
-   - `depth_anything_v2_metric_hypersim_vits.pth`
-     - Place in: `models/depth_estimation/checkpoints/`
-     - **Note:** Create the `checkpoints/` directory if it doesn't exist
+Mac:
 
 ```bash
-   # Example: Creating the checkpoints directory
-   mkdir -p models/depth_estimation/checkpoints
+brew install --cask docker
+open -a Docker
+docker --version
 ```
 
-## Environment file
+You can also install Docker Desktop from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/).
 
-Copy the example env file before running either workflow:
+Windows PowerShell:
+
+```powershell
+winget install Docker.DockerDesktop
+```
+
+After install, start Docker Desktop, enable WSL 2 integration if prompted, then verify:
+
+```powershell
+docker --version
+docker compose version
+```
+
+## Docker Commands
+
+Mac:
 
 ```bash
 cp .env.example .env
-```
-
-Default `.env.example`:
-
-```bash
-VITE_SIGNALING_BASE_URL=http://localhost:8000
-SNAPSHOT_INTERVAL_SECONDS=0.05
-SNAPSHOT_JPEG_QUALITY=92
-ANALYSIS_TARGET_FPS=15
-```
-
-`ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
-
-Optional backend env var:
-
-- `SESSION_ARTIFACTS_DIR` (default: `api/app/session_artifacts` in local dev and `/app/app/session_artifacts` in Docker)
-  - Directory where per-session processed frame dumps and manifest files are written.
-
-For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PROXY_TARGET=http://api:8000` (the helper script below configures this automatically).
-
-For better detection quality from backend snapshots, keep:
-
-- `SNAPSHOT_INTERVAL_SECONDS` around `0.05` (about 20 FPS snapshots)
-- `SNAPSHOT_JPEG_QUALITY` around `90-95`
-
-## Quick start (Docker)
-
-1. Start services:
-
-```bash
 docker compose up --build
 ```
 
-2. Open web app:
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
+```
+
+Open the app:
 
 ```text
 http://localhost:5173
 ```
 
-3. Verify API health:
+Check the API:
 
 ```text
 http://localhost:8000/health
 ```
 
-## Quick start (Local, no Docker)
+Docker Compose starts `ollama`, `api`, `model-pipeline`, and `web`. The `ollama` service pulls `OLLAMA_MODEL` into the `ollama-data` volume on first start.
 
-### Backend
+## Mac Local Commands
+
+Use this no-Docker workflow when you want local Apple MPS GPU acceleration or faster iteration.
+
+Backend terminal:
 
 ```bash
-cd api
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+cp .env.mac.example .env
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r api/requirements.txt torchvision matplotlib
+export OLLAMA_BASE_URL=http://localhost:11434
+export LENS_COMPUTE_DEVICE=mps
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Frontend
+Model pipeline terminal:
+
+```bash
+source venv/bin/activate
+export LENS_COMPUTE_DEVICE=mps
+python models/start_pipeline.py --no-video
+```
+
+Frontend terminal:
 
 ```bash
 cd web
@@ -132,149 +98,140 @@ npm install
 npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-## LAN phone testing
+If your Mac only has Python 3.11, use `python3.11 -m venv venv` instead of `python3.12 -m venv venv`.
 
-- Connect phone and dev machine to the same Wi-Fi.
-- Camera access on mobile browsers generally requires HTTPS (or localhost).
-- If you open `http://<your-dev-machine-ip>:5173`, some browsers may block `getUserMedia` and show `navigator.mediaDevices` as undefined.
-- Allow camera access when prompted.
-- In the UI, select `Phone Camera`, click `Start Source`, then `Connect`.
+## Windows Local Commands
 
-If camera is blocked, use `Video File (dev)` mode or enable HTTPS as shown below.
+Use this no-Docker workflow from PowerShell.
 
-### Local HTTPS with mkcert (recommended)
+Backend terminal:
 
-Fast path (auto setup):
-
-```bash
-scripts/setup-dev-https.sh
+```powershell
+Copy-Item .env.windows.example .env
+py -3.11 -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r api\requirements.txt torchvision matplotlib
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+python -m uvicorn app.main:app --app-dir api --host 0.0.0.0 --port 8000 --reload
 ```
 
-If IP auto-detect fails:
+Model pipeline terminal:
 
-```bash
-scripts/setup-dev-https.sh 192.168.1.42
+```powershell
+.\venv\Scripts\Activate.ps1
+python models\start_pipeline.py --no-video
 ```
 
-The script:
+Frontend terminal:
 
-- installs/trusts mkcert local CA
-- creates `web/certs/dev-cert.pem` and `web/certs/dev-key.pem`
-- updates `.env` with Docker-compatible HTTPS vars
-- sets signaling to `/api` to avoid HTTPS mixed-content errors
-
-Then restart services:
-
-```bash
-docker compose down
-docker compose up --build
+```powershell
+cd web
+npm install
+npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-Open from phone:
+## Ollama Model
+
+Default model:
 
 ```text
-https://<your-dev-machine-ip>:5173
+qwen2.5:1.5b-instruct
 ```
 
-If your phone still shows trust warnings, install/trust the mkcert local CA on the phone.
-
-### Confirm HTTPS is enabled
-
-- Vite startup output should show `https://` URLs.
-- If it still shows `http://`, `DEV_HTTPS` vars were not loaded.
-- With HTTPS enabled, signaling should go to `/api/...` (Vite proxy), not `http://localhost:8000/...`.
-
-## Signaling API contract
-
-### `POST /webrtc/offer`
-
-Request:
-
-```json
-{
-  "sdp": "...",
-  "type": "offer",
-  "session_id": "optional"
-}
-```
-
-Response:
-
-```json
-{
-  "sdp": "...",
-  "type": "answer",
-  "session_id": "uuid"
-}
-```
-
-### `POST /webrtc/ice`
-
-Request:
-
-```json
-{
-  "session_id": "uuid",
-  "candidate": "candidate:...",
-  "sdpMid": "0",
-  "sdpMLineIndex": 0
-}
-```
-
-Response:
-
-```json
-{
-  "ok": true
-}
-```
-
-## Visual stream proof (backend)
-
-1. Start a stream and connect from the web UI.
-2. Copy the session id from the UI log line:
-
-```text
-Connected signaling session <session_id>
-```
-
-Or use the built-in `Debug mode` toggle in the web UI and select a session.
-
-3. Verify backend frame intake:
-
-```text
-https://<your-dev-machine-ip>:5173/api/debug/sessions
-```
-
-You should see `total_frames` increasing and `has_snapshot: true`.
-
-4. Open live snapshot:
-
-```text
-https://<your-dev-machine-ip>:5173/api/debug/sessions/<session_id>/latest.jpg
-```
-
-Refresh to view updated snapshots from the incoming stream.
-
-5. View persisted session dump history:
-
-```text
-https://<your-dev-machine-ip>:5173/api/debug/sessions/history
-```
-
-Each session artifact stores all processed frames (`frame-*.jpg`) plus `session.json` metadata.
-The artifact path is ignored by git and excluded from API Docker build context.
-
-## Clear session frame artifacts
-
-Use the cleanup helper to remove all stored session dumps and recreate an empty artifact directory:
+Docker Compose pulls this automatically through the `ollama` service. For Docker, keep:
 
 ```bash
-scripts/clean-session-artifacts.sh
+OLLAMA_BASE_URL=http://ollama:11434
 ```
 
-You can also pass a custom artifact path:
+For local no-Docker runs, install Ollama and pull the model yourself:
 
 ```bash
-scripts/clean-session-artifacts.sh /tmp/lens-plus-artifacts
+ollama pull qwen2.5:1.5b-instruct
+ollama run qwen2.5:1.5b-instruct "Answer in one short sentence: are you ready?"
 ```
+
+For local no-Docker API runs, keep:
+
+```bash
+OLLAMA_BASE_URL=http://localhost:11434
+```
+
+See [Ollama](docs/ollama.md) for Docker, native, model, and audit settings.
+
+## Mac GPU
+
+Use native local Python and native Ollama on Apple Silicon.
+
+Ollama uses Apple's Metal GPU acceleration automatically when installed natively on supported Macs. Docker Desktop on macOS does not expose Apple MPS/Metal acceleration to Linux containers.
+
+Install native Ollama:
+
+```bash
+brew install --cask ollama
+ollama pull qwen2.5:1.5b-instruct
+```
+
+Run API and model pipeline with Apple MPS:
+
+```bash
+export LENS_COMPUTE_DEVICE=mps
+export OLLAMA_BASE_URL=http://localhost:11434
+python -c "import torch; print(torch.backends.mps.is_available())"
+```
+
+Start the backend and model pipeline from terminals that have `LENS_COMPUTE_DEVICE=mps` exported.
+
+## NVIDIA GPU
+
+For local Python GPU acceleration, install NVIDIA drivers and a CUDA-enabled PyTorch build, then run:
+
+```bash
+export LENS_COMPUTE_DEVICE=cuda
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')"
+```
+
+Use `LENS_COMPUTE_DEVICE=cuda:0` to target a specific GPU.
+
+Start the backend and model pipeline from terminals that have `LENS_COMPUTE_DEVICE=cuda` exported.
+
+For native Ollama with NVIDIA, pull and run the model normally after NVIDIA driver setup:
+
+```bash
+ollama pull qwen2.5:1.5b-instruct
+ollama run qwen2.5:1.5b-instruct "Answer in one short sentence: are you ready?"
+```
+
+For Dockerized Ollama with NVIDIA GPU, install NVIDIA Container Toolkit and start Ollama with GPU access:
+
+```bash
+docker run --gpus=all -d -v ollama-data:/root/.ollama -p 11434:11434 --name ollama ollama/ollama
+docker exec ollama ollama pull qwen2.5:1.5b-instruct
+```
+
+The repository's default `docker-compose.yml` is CPU-oriented unless you add GPU runtime settings for your NVIDIA machine. See [GPU Setup](docs/gpu.md).
+
+## Scripts
+
+| Script | Use |
+| --- | --- |
+| [`scripts/setup-dev-https.sh`](scripts/setup-dev-https.sh) | Generates mkcert HTTPS certs and updates `.env` for LAN phone camera testing. See [Phone Testing](docs/phone-testing.md). |
+| [`scripts/clean-session-artifacts.sh`](scripts/clean-session-artifacts.sh) | Removes stored session frame artifacts and recreates an empty artifact directory. See [Session Artifacts](docs/session-artifacts.md). |
+
+## Docs
+
+| Topic | Link |
+| --- | --- |
+| Architecture and repository layout | [docs/architecture.md](docs/architecture.md) |
+| Helper scripts | [scripts/](scripts/) |
+| Model files and required weights | [docs/model-files.md](docs/model-files.md) |
+| Environment variables and env examples | [docs/environment.md](docs/environment.md) |
+| Local development commands | [docs/local-development.md](docs/local-development.md) |
+| Ollama setup | [docs/ollama.md](docs/ollama.md) |
+| GPU setup | [docs/gpu.md](docs/gpu.md) |
+| Phone/LAN HTTPS testing | [docs/phone-testing.md](docs/phone-testing.md) |
+| API contract and data channel | [docs/api.md](docs/api.md) |
+| Model pipeline and sidecars | [docs/model-pipeline.md](docs/model-pipeline.md) |
+| Testing and evaluation | [docs/testing-and-evaluation.md](docs/testing-and-evaluation.md) |
+| Session artifacts and cleanup | [docs/session-artifacts.md](docs/session-artifacts.md) |

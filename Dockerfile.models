@@ -1,0 +1,32 @@
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    YOLO_CONFIG_DIR=/tmp/ultralytics
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY api/requirements.txt /tmp/api-requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r /tmp/api-requirements.txt torchvision matplotlib
+
+COPY models ./models
+COPY api/app ./api/app
+
+RUN set -eux; \
+    mkdir -p /app/api/app/session_artifacts /tmp/ultralytics; \
+    test -f /app/models/object_detection/yolov8n.pt; \
+    test -f /app/models/segmentation/src/yolov8n-seg.pt; \
+    test -f /app/models/segmentation/src/deeplabv3plus_mobilenet_finetuned.pth; \
+    test -d /app/models/segmentation/src/DeepLabV3Plus-Pytorch/network; \
+    test -f /app/models/depth_estimation/checkpoints/depth_anything_v2_metric_hypersim_vits.pth; \
+    test -f /app/models/depth_estimation/Depth-Anything-V2/metric_depth/depth_anything_v2/dpt.py
+
+CMD ["python", "-u", "models/start_pipeline.py", "--no-video", "--exit-on-child-failure"]

@@ -3,6 +3,7 @@ import sys
 import re
 import time
 import traceback
+import fcntl
 from datetime import datetime
 from pathlib import Path
 import json
@@ -19,7 +20,9 @@ if not DEEPLAB_NETWORK_PATH.exists():
         "Clone https://github.com/VainF/DeepLabV3Plus-Pytorch into "
         f"{DEEPLAB_PATH}."
     )
+APP_DIR = PROJECT_ROOT / "api" / "app"
 sys.path.insert(0, str(DEEPLAB_PATH))
+sys.path.insert(0, str(APP_DIR))
 
 import cv2
 import numpy as np
@@ -33,8 +36,7 @@ if not hasattr(network, "modeling"):
         f"Expected local module under {DEEPLAB_NETWORK_PATH}. "
         "Check your PYTHONPATH and DeepLab checkout."
     )
- 
-APP_DIR = PROJECT_ROOT / "api" / "app"
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation" / "output"
 
@@ -42,6 +44,30 @@ OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
 
 FRAME_SIZE = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2))
+    temporary_path.replace(path)
+
+
+def merge_navigation_sidecar(path: Path, updates: dict) -> None:
+    lock_path = Path(f"{path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+
+        existing.update(updates)
+        write_json_atomic(path, existing)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 # CITYSCAPES
 
@@ -114,8 +140,8 @@ class ImprovedSegmentation:
         self.target_fps = target_fps
         self.use_yolo = use_yolo
         self.deeplab_every_n_frames = deeplab_every_n_frames
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.yolo_device = 0 if self.device == "cuda" else "cpu"
+        self.device = select_torch_device(component_env_var="LENS_SEGMENTATION_DEVICE")
+        self.yolo_device = yolo_device_from_torch_device(self.device)
         print(f"Segmentation using device: {self.device}")
 
         self.mapper = CityscapesAccessibilityMapper()
@@ -124,6 +150,8 @@ class ImprovedSegmentation:
         self.prev_hazard_mask = None
 
         self.yolo_model = YOLO(yolo_model_path) if use_yolo else None
+        if self.yolo_model is not None:
+            self.yolo_model.to(self.device)
         self.deeplab_model = self.load_deeplab(deeplab_model_path)
 
         self.transform = transforms.Compose(
@@ -339,7 +367,7 @@ class ImprovedSegmentation:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.deeplab_model(tensor)
 
         preds = outputs.max(1)[1].cpu().numpy()[0]
@@ -562,28 +590,23 @@ class ImprovedSegmentation:
         infer_ms: float,
     ):
         sidecar = frame_path.with_suffix(".navigation.json")
-        try:
-            existing = json.loads(sidecar.read_text()) if sidecar.exists() else {}
-        except Exception:
-            existing = {}
-
-        existing["frame"] = frame_path.name
-        existing["timestamp"] = frame_path.stem.split("-")[-1]
-        existing["segmentation"] = {
-            "walkable_status": nav["status"],
-            "direction": nav["direction"],
-            "zone_scores": {k: round(float(v), 2) for k, v in nav["scores"].items()},
-            "walkable_pixel_ratio": round(float(np.sum(walkable)) / walkable.size, 4),
-            "hazard_pixel_ratio": round(float(np.sum(hazard)) / hazard.size, 4),
-            "dynamic_obstacle_ratio": round(float(np.sum(dynamic)) / dynamic.size, 4),
-            "iou": iou,
-            "dice": dice,
-            "focal_loss": focal,
-            "mean_surface_distance": msd,
-            "inference_latency_ms": infer_ms,
-        }
-
-        sidecar.write_text(json.dumps(existing, indent=2))
+        merge_navigation_sidecar(sidecar, {
+            "frame": frame_path.name,
+            "timestamp": frame_path.stem.split("-")[-1],
+            "segmentation": {
+                "walkable_status": nav["status"],
+                "direction": nav["direction"],
+                "zone_scores": {k: round(float(v), 2) for k, v in nav["scores"].items()},
+                "walkable_pixel_ratio": round(float(np.sum(walkable)) / walkable.size, 4),
+                "hazard_pixel_ratio": round(float(np.sum(hazard)) / hazard.size, 4),
+                "dynamic_obstacle_ratio": round(float(np.sum(dynamic)) / dynamic.size, 4),
+                "iou": iou,
+                "dice": dice,
+                "focal_loss": focal,
+                "mean_surface_distance": msd,
+                "inference_latency_ms": infer_ms,
+            },
+        })
     
 
     def process_group(

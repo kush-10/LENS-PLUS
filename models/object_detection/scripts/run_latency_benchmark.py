@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+APP_DIR = Path(__file__).resolve().parents[3] / "api" / "app"
+sys.path.insert(0, str(APP_DIR))
+
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 try:
     import cv2
@@ -89,7 +95,10 @@ def _percentile(values: list[float], pct: float) -> float:
 
 def main() -> int:
     args = parse_args()
+    device = select_torch_device(component_env_var="LENS_DETECTION_DEVICE")
+    yolo_device = yolo_device_from_torch_device(device)
     model = YOLO(args.model)
+    model.to(device)
     frame_iter = _iter_frames(args.source)
 
     for _ in range(max(0, args.warmup)):
@@ -97,7 +106,13 @@ def main() -> int:
             frame = next(frame_iter)
         except StopIteration:
             raise SystemExit("Source ended before warmup completed.")
-        model.predict(frame, conf=args.conf, imgsz=args.imgsz, verbose=False)
+        model.predict(
+            frame,
+            conf=args.conf,
+            imgsz=args.imgsz,
+            verbose=False,
+            device=yolo_device,
+        )
 
     latencies_ms: list[float] = []
     started_at = time.perf_counter()
@@ -107,7 +122,13 @@ def main() -> int:
         except StopIteration:
             break
         t0 = time.perf_counter()
-        model.predict(frame, conf=args.conf, imgsz=args.imgsz, verbose=False)
+        model.predict(
+            frame,
+            conf=args.conf,
+            imgsz=args.imgsz,
+            verbose=False,
+            device=yolo_device,
+        )
         t1 = time.perf_counter()
         latencies_ms.append((t1 - t0) * 1000.0)
 
@@ -119,6 +140,7 @@ def main() -> int:
     fps = measured_frames / elapsed if elapsed > 0 else 0.0
     print("Latency/FPS benchmark")
     print(f"- model: {args.model}")
+    print(f"- device: {device}")
     print(f"- frames_measured: {measured_frames}")
     print(f"- avg_ms: {statistics.mean(latencies_ms):.2f}")
     print(f"- p50_ms: {_percentile(latencies_ms, 50):.2f}")

@@ -1,6 +1,6 @@
 import "./styles.css";
 import { startCameraStream, stopStream } from "./media/cameraSource";
-import type { DirectionalContext, InferenceMessage } from "./types/messages";
+import type { InferenceMessage } from "./types/messages";
 import { isInferenceMessage } from "./types/messages";
 import { UiLogger } from "./ui/logger";
 import { WebRtcClient } from "./webrtc/client";
@@ -9,39 +9,75 @@ import { getSignalingBaseUrl } from "./webrtc/signaling";
 type PageName = "home" | "camera" | "admin";
 type ThemeName = "dark" | "light";
 type StatusTone = "up" | "warn" | "down" | "neutral";
-type SensorPermissionState = "unknown" | "granted" | "denied" | "unsupported";
 
-type RotationRateDps = {
-  alpha: number | null;
-  beta: number | null;
-  gamma: number | null;
+const QUESTION_STAGE_LABELS: Record<string, string> = {
+  idle: "Idle",
+  connecting: "Connecting",
+  ready: "Ready",
+  listening: "Listening",
+  waiting: "Waiting",
+  running_vlm: "VLM",
+  waiting_model_context: "Context",
+  model_context_ready: "Context Ready",
+  model_context_unavailable: "Context Missing",
+  running_llm: "LLM",
+  generating_speech: "TTS",
+  complete: "Complete"
 };
 
-type OrientationDegrees = {
-  alpha: number | null;
-  beta: number | null;
-  gamma: number | null;
-  absolute: boolean | null;
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
 };
 
-type DirectionalTelemetryMessage = {
-  type: "client_sensor";
-  sensor: "gyro";
-  timestamp_ms: number;
-  rotation_rate_dps: RotationRateDps | null;
-  orientation_deg: OrientationDegrees | null;
+type SpeechRecognitionResultLike = {
+  readonly isFinal: boolean;
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionAlternativeLike;
+};
+
+type SpeechRecognitionResultListLike = {
+  readonly length: number;
+  readonly [index: number]: SpeechRecognitionResultLike;
+};
+
+type SpeechRecognitionEventLike = Event & {
+  readonly results: SpeechRecognitionResultListLike;
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  readonly error?: string;
+  readonly message?: string;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
+
+type AudioContextWindow = Window & {
+  webkitAudioContext?: typeof AudioContext;
 };
 
 const SEND_TARGET_FPS = 30;
+const LANDSCAPE_FEED_WIDTH = 1280;
+const LANDSCAPE_FEED_HEIGHT = 720;
 const ADMIN_PREVIEW_POLL_MS = 750;
 const THEME_STORAGE_KEY = "lensplus-theme";
-const SENSOR_TELEMETRY_INTERVAL_MS = 120;
-const RELATIVE_HEADING_CENTER_BAND_DEG = 3;
-const RELATIVE_PITCH_CENTER_BAND_DEG = 3;
-const HEADING_SMOOTHING_ALPHA = 0.18;
-const PITCH_SMOOTHING_ALPHA = 0.22;
-const HEADING_JITTER_DEADBAND_DEG = 1.5;
-const PITCH_JITTER_DEADBAND_DEG = 1.5;
+const MAX_PROCESS_EVENTS = 24;
 
 type DebugSession = {
   session_id: string;
@@ -58,13 +94,12 @@ type DebugSession = {
   has_snapshot: boolean;
   snapshot_errors: number;
   last_snapshot_error: string | null;
-  directional_samples_received: number;
-  directional_messages_ignored: number;
-  directional_parse_errors: number;
-  latest_directional_received_at: string | null;
-  latest_directional_client_timestamp_ms: number | null;
-  latest_processed_directional: DirectionalContext | null;
   updated_at: string;
+};
+
+type LandscapeFeedOutput = {
+  stream: MediaStream;
+  stop(): void;
 };
 
 type RawDebugSession = Partial<DebugSession> & { session_id: string };
@@ -155,52 +190,6 @@ function toneForHealth(rawStatus: string): StatusTone {
   return "warn";
 }
 
-function toneForDirectionalLink(
-  directional: DirectionalContext | null,
-  sampleCount: number
-): StatusTone {
-  if (sampleCount <= 0) {
-    return "warn";
-  }
-
-  if (!directional) {
-    return "warn";
-  }
-
-  if (directional.is_stale) {
-    return "warn";
-  }
-
-  return "up";
-}
-
-function formatDirectionalLinkLabel(
-  directional: DirectionalContext | null,
-  sampleCount: number
-): string {
-  if (sampleCount <= 0) {
-    return "No samples";
-  }
-
-  if (!directional) {
-    return "Awaiting frame";
-  }
-
-  if (directional.is_stale) {
-    return "Stale";
-  }
-
-  return "Fresh";
-}
-
-function formatDirectionalAge(direction: DirectionalContext | null): string {
-  if (!direction || typeof direction.age_ms !== "number" || !Number.isFinite(direction.age_ms)) {
-    return "n/a";
-  }
-
-  return `${Math.max(0, Math.round(direction.age_ms))} ms`;
-}
-
 function createStatusPill(label: string, tone: StatusTone): HTMLElement {
   const pill = document.createElement("span");
   pill.className = `status-pill tone-${tone}`;
@@ -238,28 +227,6 @@ function normalizeDebugSession(session: RawDebugSession): DebugSession {
     snapshot_errors:
       typeof session.snapshot_errors === "number" ? session.snapshot_errors : 0,
     last_snapshot_error: session.last_snapshot_error ?? null,
-    directional_samples_received:
-      typeof session.directional_samples_received === "number"
-        ? session.directional_samples_received
-        : 0,
-    directional_messages_ignored:
-      typeof session.directional_messages_ignored === "number"
-        ? session.directional_messages_ignored
-        : 0,
-    directional_parse_errors:
-      typeof session.directional_parse_errors === "number"
-        ? session.directional_parse_errors
-        : 0,
-    latest_directional_received_at: session.latest_directional_received_at ?? null,
-    latest_directional_client_timestamp_ms:
-      typeof session.latest_directional_client_timestamp_ms === "number"
-        ? session.latest_directional_client_timestamp_ms
-        : null,
-    latest_processed_directional:
-      typeof session.latest_processed_directional === "object" &&
-      session.latest_processed_directional !== null
-        ? session.latest_processed_directional
-        : null,
     updated_at: session.updated_at ?? ""
   };
 }
@@ -272,6 +239,7 @@ if (!app) {
 app.innerHTML = `
   <main class="app-shell">
     <div class="global-actions">
+      <button id="top-home" class="ghost home-control hidden" type="button">Home</button>
       <button id="theme-toggle" class="ghost theme-toggle" type="button">Light mode</button>
     </div>
 
@@ -284,47 +252,30 @@ app.innerHTML = `
       </div>
     </section>
 
-    <section id="camera-page" class="page hidden">
-      <div class="page-top">
-        <button id="camera-home" class="ghost">Home</button>
-      </div>
+    <section id="camera-page" class="page camera-page hidden">
       <div class="camera-wrap">
         <video id="camera-preview" autoplay muted playsinline></video>
       </div>
-      <section class="direction-card" aria-live="polite">
-        <div class="direction-card-header">
-          <h2 class="direction-card-title">Direction</h2>
-          <button id="direction-reset" class="ghost direction-reset" type="button">
-            Recenter
-          </button>
+      <div class="camera-actions">
+        <button id="start-feed" class="primary">Start Feed</button>
+        <button id="camera-record-question" class="camera-record-box" type="button">Record Question</button>
+      </div>
+      <section class="camera-question-panel" aria-live="polite">
+        <div class="camera-question-block">
+          <span>Speech to text</span>
+          <p id="question-transcript" class="camera-question-text is-muted">Record a question to see the transcript here.</p>
         </div>
-        <div class="direction-card-body">
-          <div class="direction-dial" aria-hidden="true">
-            <span class="direction-origin"></span>
-            <span id="direction-needle" class="direction-needle"></span>
-            <span class="direction-center-dot"></span>
-          </div>
-          <div class="direction-readout">
-            <p id="direction-relative-value" class="direction-value">--</p>
-            <p id="direction-relative-text" class="direction-text">
-              Start feed to calibrate origin.
-            </p>
-            <p id="direction-pitch-value" class="direction-subvalue">Pitch --</p>
-            <p id="direction-pitch-arrow" class="direction-arrow">^v At origin</p>
-            <p id="direction-pitch-text" class="direction-subtext">
-              Keep device level to calibrate tilt.
-            </p>
+        <div class="camera-question-block">
+          <span>Assistant response</span>
+          <div class="camera-response-box">
+            <span id="answer-stage-badge" class="answer-stage-badge" aria-label="Assistant response stage">Idle</span>
+            <p id="answer-output" class="camera-question-text">No answer yet.</p>
           </div>
         </div>
       </section>
-      <button id="start-feed" class="primary">Start Feed</button>
     </section>
 
     <section id="admin-page" class="page hidden">
-      <div class="page-top">
-        <button id="admin-home" class="ghost">Home</button>
-      </div>
-
       <section class="panel">
         <h2>Feeds</h2>
         <div class="feed-grid">
@@ -390,28 +341,34 @@ app.innerHTML = `
               <th>Total Frames Received</th>
               <td id="status-total-frames"></td>
             </tr>
-            <tr>
-              <th>Directional Link</th>
-              <td id="status-directional-link"></td>
-            </tr>
-            <tr>
-              <th>Directional Age</th>
-              <td id="status-directional-age"></td>
-            </tr>
-            <tr>
-              <th>Sensor Samples</th>
-              <td id="status-directional-samples"></td>
-            </tr>
-            <tr>
-              <th>Sensor Parse Errors</th>
-              <td id="status-directional-errors"></td>
-            </tr>
-            <tr>
-              <th>Sensor Messages Ignored</th>
-              <td id="status-directional-ignored"></td>
-            </tr>
           </tbody>
         </table>
+      </section>
+
+      <section class="panel process-panel">
+        <div class="panel-title-row">
+          <h2>Process Status</h2>
+          <button id="process-status-toggle" class="ghost" type="button" aria-expanded="false">
+            Show Process Status
+          </button>
+        </div>
+        <div id="process-status-body" class="process-status-body hidden">
+          <div class="process-status-grid">
+            <div class="process-status-card">
+              <span>Feed</span>
+              <strong id="admin-feed-status">Camera idle.</strong>
+            </div>
+            <div class="process-status-card">
+              <span>Question</span>
+              <strong id="admin-question-status">idle</strong>
+            </div>
+            <div class="process-status-card">
+              <span>Question to response</span>
+              <strong id="admin-response-time">n/a</strong>
+            </div>
+          </div>
+          <ul id="process-event-log" class="process-event-log"></ul>
+        </div>
       </section>
 
       <section class="panel">
@@ -425,20 +382,13 @@ app.innerHTML = `
 const homePageEl = mustQuery<HTMLElement>("#home-page");
 const cameraPageEl = mustQuery<HTMLElement>("#camera-page");
 const adminPageEl = mustQuery<HTMLElement>("#admin-page");
+const topHomeEl = mustQuery<HTMLButtonElement>("#top-home");
 const themeToggleEl = mustQuery<HTMLButtonElement>("#theme-toggle");
 const goCameraEl = mustQuery<HTMLButtonElement>("#go-camera");
 const goAdminEl = mustQuery<HTMLButtonElement>("#go-admin");
-const cameraHomeEl = mustQuery<HTMLButtonElement>("#camera-home");
-const adminHomeEl = mustQuery<HTMLButtonElement>("#admin-home");
 const startFeedEl = mustQuery<HTMLButtonElement>("#start-feed");
+const cameraRecordQuestionEl = mustQuery<HTMLButtonElement>("#camera-record-question");
 const cameraPreviewEl = mustQuery<HTMLVideoElement>("#camera-preview");
-const directionResetEl = mustQuery<HTMLButtonElement>("#direction-reset");
-const directionNeedleEl = mustQuery<HTMLElement>("#direction-needle");
-const directionRelativeValueEl = mustQuery<HTMLElement>("#direction-relative-value");
-const directionRelativeTextEl = mustQuery<HTMLElement>("#direction-relative-text");
-const directionPitchValueEl = mustQuery<HTMLElement>("#direction-pitch-value");
-const directionPitchArrowEl = mustQuery<HTMLElement>("#direction-pitch-arrow");
-const directionPitchTextEl = mustQuery<HTMLElement>("#direction-pitch-text");
 const adminLivePreviewEl = mustQuery<HTMLImageElement>("#admin-live-preview");
 const adminLiveStatusEl = mustQuery<HTMLElement>("#admin-live-status");
 const connectionBadgeEl = mustQuery<HTMLElement>("#connection-badge");
@@ -453,17 +403,32 @@ const statusIncomingFpsEl = mustQuery<HTMLElement>("#status-incoming-fps");
 const statusProcessedFpsEl = mustQuery<HTMLElement>("#status-processed-fps");
 const statusDroppedFramesEl = mustQuery<HTMLElement>("#status-dropped-frames");
 const statusTotalFramesEl = mustQuery<HTMLElement>("#status-total-frames");
-const statusDirectionalLinkEl = mustQuery<HTMLElement>("#status-directional-link");
-const statusDirectionalAgeEl = mustQuery<HTMLElement>("#status-directional-age");
-const statusDirectionalSamplesEl = mustQuery<HTMLElement>("#status-directional-samples");
-const statusDirectionalErrorsEl = mustQuery<HTMLElement>("#status-directional-errors");
-const statusDirectionalIgnoredEl = mustQuery<HTMLElement>("#status-directional-ignored");
+const processStatusToggleEl = mustQuery<HTMLButtonElement>("#process-status-toggle");
+const processStatusBodyEl = mustQuery<HTMLElement>("#process-status-body");
+const adminFeedStatusEl = mustQuery<HTMLElement>("#admin-feed-status");
+const adminQuestionStatusEl = mustQuery<HTMLElement>("#admin-question-status");
+const adminResponseTimeEl = mustQuery<HTMLElement>("#admin-response-time");
+const processEventLogEl = mustQuery<HTMLUListElement>("#process-event-log");
+const questionTranscriptEl = mustQuery<HTMLElement>("#question-transcript");
+const answerStageBadgeEl = mustQuery<HTMLElement>("#answer-stage-badge");
+const answerOutputEl = mustQuery<HTMLElement>("#answer-output");
 const eventLogEl = mustQuery<HTMLUListElement>("#event-log");
 
 let currentPage: PageName = "home";
 let activeTheme: ThemeName = loadStoredTheme() ?? "dark";
 let activeStream: MediaStream | null = null;
+let activeCameraStream: MediaStream | null = null;
+let activeLandscapeFeed: LandscapeFeedOutput | null = null;
 let activeSessionId: string | null = null;
+let questionRecognition: SpeechRecognitionLike | null = null;
+let questionTranscript = "";
+let audioResponsePlayer: HTMLAudioElement | null = null;
+let audioResponseContext: AudioContext | null = null;
+let audioResponseSource: AudioBufferSourceNode | null = null;
+let audioResponseObjectUrl: string | null = null;
+let audioResponseUnlocked = false;
+let discardQuestionTranscript = false;
+let questionRecordingStopPending = false;
 let peerState: RTCPeerConnectionState = "closed";
 const sendTargetFps = SEND_TARGET_FPS;
 let latestHealthStatus = "unknown";
@@ -472,28 +437,29 @@ let latestSelectedSession: DebugSession | null = null;
 let adminPreviewSessionId: string | null = null;
 let adminPreviewHasSnapshot = false;
 let viewportConstraintTimer: number | null = null;
-let directionalPermissionsResolved = false;
-let motionPermissionState: SensorPermissionState = "unknown";
-let orientationPermissionState: SensorPermissionState = "unknown";
-let directionalTelemetryActive = false;
-let latestRotationRateDps: RotationRateDps | null = null;
-let latestOrientationDegrees: OrientationDegrees | null = null;
-let lastDirectionalTelemetrySentAtMs = 0;
-let headingOriginAlphaDeg: number | null = null;
-let headingCurrentAlphaDeg: number | null = null;
-let headingSmoothedAlphaDeg: number | null = null;
-let pitchOriginBetaDeg: number | null = null;
-let pitchCurrentBetaDeg: number | null = null;
-let pitchSmoothedBetaDeg: number | null = null;
-let displayedRelativeHeadingDeg: number | null = null;
-let displayedRelativePitchDeg: number | null = null;
+let processStatusVisible = false;
+let latestFeedStatus = "Camera idle.";
+let latestQuestionStatus = "idle";
+let latestQuestionStage = "idle";
+let questionSentAtMs: number | null = null;
+let latestQuestionResponseDurationMs: number | null = null;
+let questionResponsePending = false;
+const processEvents: string[] = [];
 const logger = new UiLogger(eventLogEl);
 const apiBaseUrl = getSignalingBaseUrl();
 const errorCache = new Map<string, string>();
 
 showAdminLiveStatus("No active session.");
+setFeedStatus("Camera idle.", false);
+setQuestionStatus("idle", false);
 
 adminLivePreviewEl.addEventListener("load", () => {
+  if (adminLivePreviewEl.naturalWidth > 0 && adminLivePreviewEl.naturalHeight > 0) {
+    adminLivePreviewEl.style.setProperty(
+      "--admin-preview-aspect-ratio",
+      `${adminLivePreviewEl.naturalWidth} / ${adminLivePreviewEl.naturalHeight}`
+    );
+  }
   adminLivePreviewEl.hidden = false;
   adminLiveStatusEl.hidden = true;
 });
@@ -509,7 +475,11 @@ adminLivePreviewEl.addEventListener("error", () => {
 const webrtc = new WebRtcClient(
   (state) => {
     peerState = state;
+    if (!questionRecognition && !questionRecordingStopPending) {
+      setQuestionStatus(state === "connected" ? "ready" : "idle");
+    }
     renderConnectionBadge();
+    renderQuestionRecorder();
     renderLatestDashboard();
   },
   (payload) => {
@@ -517,6 +487,12 @@ const webrtc = new WebRtcClient(
   },
   (message) => {
     logger.log(message);
+    if (message === "Data channel open" || message === "Data channel closed") {
+      if (!questionRecognition && !questionRecordingStopPending) {
+        setQuestionStatus(message === "Data channel open" && activeStream ? "ready" : "idle");
+      }
+      renderQuestionRecorder();
+    }
   }
 );
 
@@ -528,25 +504,27 @@ goAdminEl.addEventListener("click", () => {
   showPage("admin");
 });
 
-cameraHomeEl.addEventListener("click", () => {
-  showPage("home");
-});
-
-adminHomeEl.addEventListener("click", () => {
+topHomeEl.addEventListener("click", () => {
   showPage("home");
 });
 
 startFeedEl.addEventListener("click", () => {
+  unlockAudioResponsePlayback();
   void toggleFeed();
 });
 
-directionResetEl.addEventListener("click", () => {
-  recenterDirectionOrigin();
+cameraRecordQuestionEl.addEventListener("click", () => {
+  unlockAudioResponsePlayback();
+  void toggleCameraQuestionRecording();
 });
 
 themeToggleEl.addEventListener("click", () => {
   const nextTheme: ThemeName = activeTheme === "dark" ? "light" : "dark";
   setTheme(nextTheme, true);
+});
+
+processStatusToggleEl.addEventListener("click", () => {
+  setProcessStatusVisible(!processStatusVisible);
 });
 
 cameraPreviewEl.addEventListener("loadedmetadata", () => {
@@ -581,17 +559,21 @@ window.setInterval(() => {
 }, ADMIN_PREVIEW_POLL_MS);
 
 window.addEventListener("beforeunload", () => {
-  stopDirectionalTelemetry();
+  resetQuestionRecorder();
+  stopAudioResponsePlayback();
+  stopLandscapeFeedOutput();
   stopStream(activeStream);
+  stopStream(activeCameraStream);
   void webrtc.disconnect();
 });
 
 showPage("home");
 setTheme(activeTheme, false);
 renderStartButton();
+renderQuestionRecorder();
 renderConnectionBadge();
 renderLatestDashboard();
-renderRelativeDirectionWidget();
+renderProcessStatus();
 updateViewportLayout();
 
 function showPage(page: PageName): void {
@@ -599,6 +581,7 @@ function showPage(page: PageName): void {
   homePageEl.classList.toggle("hidden", page !== "home");
   cameraPageEl.classList.toggle("hidden", page !== "camera");
   adminPageEl.classList.toggle("hidden", page !== "admin");
+  topHomeEl.classList.toggle("hidden", page === "home");
 
   if (page === "camera") {
     updateViewportLayout();
@@ -618,21 +601,37 @@ async function toggleFeed(): Promise<void> {
   await startFeed();
 }
 
+async function toggleCameraQuestionRecording(): Promise<void> {
+  try {
+    if (questionRecognition) {
+      await stopQuestionRecording();
+      return;
+    }
+
+    startQuestionRecording();
+  } catch (error) {
+    const message = formatErrorMessage(error);
+    setQuestionStatus(`Question recording failed: ${message}`);
+    logger.log(`Question recording failed: ${message}`);
+    renderQuestionRecorder();
+  }
+}
+
 async function startFeed(): Promise<void> {
   startFeedEl.disabled = true;
-  resetRelativeDirectionState();
-  renderRelativeDirectionWidget();
+  setQuestionStatus("connecting");
+  setFeedStatus("Starting camera...");
 
   try {
-    await resolveDirectionalPermissions();
-    activeStream = await startCameraStream(sendTargetFps);
-    attachStreamToCameraPreview(activeStream);
+    activeCameraStream = await startCameraStream(sendTargetFps);
+    attachStreamToCameraPreview(activeCameraStream);
     await applyViewportCameraConstraints();
+    activeStream = startLandscapeFeedOutput(cameraPreviewEl, sendTargetFps);
     logger.log("Camera stream started");
+    setFeedStatus("Camera started. Connecting feed...");
 
     await webrtc.connect(activeStream);
     activeSessionId = webrtc.getSessionId();
-    startDirectionalTelemetry();
 
     if (activeSessionId) {
       logger.log(`Active session ${activeSessionId}`);
@@ -640,25 +639,37 @@ async function startFeed(): Promise<void> {
 
     await applySendFramerate(sendTargetFps, false);
     await refreshAdminData();
+    setQuestionStatus(webrtc.isReadyToSend() ? "ready" : "connecting");
+    setFeedStatus("Feed connected.");
   } catch (error) {
-    logger.log(`Start feed failed: ${String(error)}`);
+    const message = formatErrorMessage(error);
+    logger.log(`Start feed failed: ${message}`);
+    setQuestionStatus("idle");
+    setFeedStatus(`Feed failed: ${message}`);
     await stopFeed(false);
   } finally {
     startFeedEl.disabled = false;
     renderStartButton();
+    renderQuestionRecorder();
     renderLatestDashboard();
   }
 }
 
 async function stopFeed(shouldLog: boolean): Promise<void> {
+  resetQuestionRecorder();
   const stream = activeStream;
+  const cameraStream = activeCameraStream;
   activeStream = null;
+  activeCameraStream = null;
+  stopLandscapeFeedOutput();
 
-  stopDirectionalTelemetry();
-  resetRelativeDirectionState();
   await webrtc.disconnect();
+  setQuestionStatus("idle");
   if (stream) {
     stopStream(stream);
+  }
+  if (cameraStream) {
+    stopStream(cameraStream);
   }
 
   activeSessionId = null;
@@ -674,10 +685,11 @@ async function stopFeed(shouldLog: boolean): Promise<void> {
 
   if (shouldLog) {
     logger.log("Feed stopped");
+    setFeedStatus("Feed stopped.");
   }
 
   renderStartButton();
-  renderRelativeDirectionWidget();
+  renderQuestionRecorder();
   renderLatestDashboard();
 }
 
@@ -690,9 +702,155 @@ function attachStreamToCameraPreview(stream: MediaStream | null): void {
 
   if (!stream) {
     cameraPageEl.dataset.videoOrientation = "unknown";
+    cameraPageEl.style.removeProperty("--camera-aspect-ratio");
   }
 
   updateViewportLayout();
+}
+
+function startLandscapeFeedOutput(
+  sourceVideo: HTMLVideoElement,
+  targetFps: number
+): MediaStream {
+  stopLandscapeFeedOutput();
+
+  const canvas = document.createElement("canvas");
+  canvas.width = LANDSCAPE_FEED_WIDTH;
+  canvas.height = LANDSCAPE_FEED_HEIGHT;
+
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Landscape feed renderer is unavailable");
+  }
+
+  if (typeof canvas.captureStream !== "function") {
+    throw new Error("Landscape feed capture is unavailable in this browser");
+  }
+
+  const frameIntervalMs = 1000 / Math.max(1, targetFps);
+  let animationFrameId: number | null = null;
+  let lastFrameAtMs = 0;
+  let stopped = false;
+
+  const drawFrame = (timestampMs: number): void => {
+    if (stopped) {
+      return;
+    }
+
+    if (timestampMs - lastFrameAtMs >= frameIntervalMs) {
+      drawVideoIntoLandscapeCanvas(sourceVideo, context, canvas);
+      lastFrameAtMs = timestampMs;
+    }
+
+    animationFrameId = window.requestAnimationFrame(drawFrame);
+  };
+
+  drawVideoIntoLandscapeCanvas(sourceVideo, context, canvas);
+  animationFrameId = window.requestAnimationFrame(drawFrame);
+
+  const stream = canvas.captureStream(targetFps);
+  activeLandscapeFeed = {
+    stream,
+    stop() {
+      stopped = true;
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
+      }
+      stopStream(stream);
+    }
+  };
+
+  return stream;
+}
+
+function stopLandscapeFeedOutput(): void {
+  const output = activeLandscapeFeed;
+  activeLandscapeFeed = null;
+  output?.stop();
+}
+
+function drawVideoIntoLandscapeCanvas(
+  sourceVideo: HTMLVideoElement,
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement
+): void {
+  const sourceWidth = sourceVideo.videoWidth;
+  const sourceHeight = sourceVideo.videoHeight;
+  context.fillStyle = "#000";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (sourceWidth <= 0 || sourceHeight <= 0) {
+    return;
+  }
+
+  const targetAspectRatio = canvas.width / canvas.height;
+  const sourceAspectRatio = sourceWidth / sourceHeight;
+  let cropX = 0;
+  let cropY = 0;
+  let cropWidth = sourceWidth;
+  let cropHeight = sourceHeight;
+
+  if (sourceAspectRatio > targetAspectRatio) {
+    cropWidth = sourceHeight * targetAspectRatio;
+    cropX = (sourceWidth - cropWidth) / 2;
+  } else {
+    cropHeight = sourceWidth / targetAspectRatio;
+    cropY = (sourceHeight - cropHeight) / 2;
+  }
+
+  context.drawImage(
+    sourceVideo,
+    cropX,
+    cropY,
+    cropWidth,
+    cropHeight,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+}
+
+function setFeedStatus(message: string, recordEvent = true): void {
+  latestFeedStatus = message;
+  if (recordEvent) {
+    addProcessEvent("Feed", message);
+  }
+  renderProcessStatus();
+}
+
+function setQuestionStatus(message: string, recordEvent = true, stage = message): void {
+  latestQuestionStatus = message;
+  latestQuestionStage = stage;
+  if (recordEvent) {
+    addProcessEvent("Question", message);
+  }
+  renderProcessStatus();
+}
+
+function addProcessEvent(scope: "Feed" | "Question", message: string): void {
+  const now = new Date().toLocaleTimeString();
+  processEvents.unshift(`[${now}] ${scope}: ${message}`);
+  while (processEvents.length > MAX_PROCESS_EVENTS) {
+    processEvents.pop();
+  }
+}
+
+function setQuestionTranscript(message: string, muted: boolean): void {
+  questionTranscriptEl.textContent = message;
+  questionTranscriptEl.classList.toggle("is-muted", muted);
+}
+
+function setAnswerOutput(message: string): void {
+  answerOutputEl.textContent = message;
+}
+
+function formatErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
 
 function setTheme(theme: ThemeName, persist: boolean): void {
@@ -717,18 +875,13 @@ function updateViewportLayout(): void {
 
   cameraPageEl.dataset.orientation =
     viewportHeight >= viewportWidth ? "portrait" : "landscape";
+  cameraPageEl.dataset.videoOrientation = "landscape";
+  cameraPageEl.style.setProperty(
+    "--camera-aspect-ratio",
+    `${LANDSCAPE_FEED_WIDTH} / ${LANDSCAPE_FEED_HEIGHT}`
+  );
 
-  if (cameraPreviewEl.videoWidth <= 0 || cameraPreviewEl.videoHeight <= 0) {
-    cameraPageEl.dataset.videoOrientation = "unknown";
-    return;
-  }
-
-  cameraPageEl.dataset.videoOrientation =
-    cameraPreviewEl.videoHeight >= cameraPreviewEl.videoWidth
-      ? "portrait"
-      : "landscape";
-
-  if (!activeStream) {
+  if (!activeCameraStream) {
     return;
   }
 
@@ -743,24 +896,16 @@ function updateViewportLayout(): void {
 }
 
 async function applyViewportCameraConstraints(): Promise<void> {
-  const track = activeStream?.getVideoTracks()[0] ?? null;
+  const track = activeCameraStream?.getVideoTracks()[0] ?? null;
   if (!track) {
     return;
   }
 
-  const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
-  const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-  const viewportIsPortrait = viewportHeight >= viewportWidth;
-
-  const idealWidth = viewportIsPortrait ? 720 : 1280;
-  const idealHeight = viewportIsPortrait ? 1280 : 720;
-  const idealAspectRatio = viewportIsPortrait ? 9 / 16 : 16 / 9;
-
   try {
     await track.applyConstraints({
-      width: { ideal: idealWidth },
-      height: { ideal: idealHeight },
-      aspectRatio: { ideal: idealAspectRatio },
+      width: { ideal: LANDSCAPE_FEED_WIDTH },
+      height: { ideal: LANDSCAPE_FEED_HEIGHT },
+      aspectRatio: { ideal: LANDSCAPE_FEED_WIDTH / LANDSCAPE_FEED_HEIGHT },
       frameRate: { ideal: sendTargetFps, max: sendTargetFps }
     });
   } catch {
@@ -770,6 +915,20 @@ async function applyViewportCameraConstraints(): Promise<void> {
 
 function renderStartButton(): void {
   startFeedEl.textContent = activeStream ? "Stop Feed" : "Start Feed";
+}
+
+function renderQuestionRecorder(): void {
+  const isRecording = Boolean(questionRecognition);
+  const canStartRecording = Boolean(activeStream) && webrtc.isReadyToSend();
+
+  cameraRecordQuestionEl.textContent = questionRecordingStopPending
+    ? "Sending..."
+    : isRecording
+      ? "Stop Recording"
+      : "Record Question";
+  cameraRecordQuestionEl.classList.toggle("is-recording", isRecording);
+  cameraRecordQuestionEl.setAttribute("aria-pressed", isRecording ? "true" : "false");
+  cameraRecordQuestionEl.disabled = questionRecordingStopPending || (!isRecording && !canStartRecording);
 }
 
 function renderConnectionBadge(): void {
@@ -791,6 +950,129 @@ function renderConnectionBadge(): void {
   connectionBadgeEl.textContent = label;
   connectionBadgeEl.classList.remove("is-up", "is-warn", "is-down", "is-neutral");
   connectionBadgeEl.classList.add(`is-${tone}`);
+}
+
+function setProcessStatusVisible(visible: boolean): void {
+  processStatusVisible = visible;
+  renderProcessStatus();
+}
+
+function renderProcessStatus(): void {
+  answerStageBadgeEl.textContent = formatQuestionStageLabel(latestQuestionStage);
+  answerStageBadgeEl.title = humanizeState(latestQuestionStage);
+  processStatusBodyEl.classList.toggle("hidden", !processStatusVisible);
+  processStatusToggleEl.textContent = processStatusVisible
+    ? "Hide Process Status"
+    : "Show Process Status";
+  processStatusToggleEl.setAttribute(
+    "aria-expanded",
+    processStatusVisible ? "true" : "false"
+  );
+  adminFeedStatusEl.textContent = latestFeedStatus;
+  adminQuestionStatusEl.textContent = latestQuestionStatus;
+  adminResponseTimeEl.textContent = formatQuestionResponseTime();
+  processEventLogEl.innerHTML = "";
+
+  if (processEvents.length === 0) {
+    const emptyEntry = document.createElement("li");
+    emptyEntry.textContent = "No process events yet.";
+    emptyEntry.className = "is-muted";
+    processEventLogEl.appendChild(emptyEntry);
+    return;
+  }
+
+  for (const event of processEvents) {
+    const entry = document.createElement("li");
+    entry.textContent = event;
+    processEventLogEl.appendChild(entry);
+  }
+}
+
+function markQuestionSent(): void {
+  questionSentAtMs = performance.now();
+  latestQuestionResponseDurationMs = null;
+  questionResponsePending = true;
+  renderProcessStatus();
+}
+
+function markQuestionResponseReceived(): void {
+  if (questionSentAtMs === null) {
+    return;
+  }
+
+  latestQuestionResponseDurationMs = performance.now() - questionSentAtMs;
+  questionSentAtMs = null;
+  questionResponsePending = false;
+  addProcessEvent(
+    "Question",
+    `Response completed in ${formatDuration(latestQuestionResponseDurationMs)}`
+  );
+  renderProcessStatus();
+}
+
+function formatQuestionResponseTime(): string {
+  if (questionResponsePending && questionSentAtMs !== null) {
+    return `Waiting ${formatDuration(performance.now() - questionSentAtMs)}`;
+  }
+
+  if (latestQuestionResponseDurationMs !== null) {
+    return formatDuration(latestQuestionResponseDurationMs);
+  }
+
+  return "n/a";
+}
+
+function formatDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return "n/a";
+  }
+
+  if (durationMs < 1000) {
+    return `${Math.round(durationMs)} ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(1)} s`;
+}
+
+function formatQuestionStageLabel(rawStage: string): string {
+  const normalized = rawStage.trim().toLowerCase();
+  if (!normalized) {
+    return "Idle";
+  }
+
+  const mappedLabel = QUESTION_STAGE_LABELS[normalized];
+  if (mappedLabel) {
+    return mappedLabel;
+  }
+
+  if (normalized.includes("llm")) {
+    return "LLM";
+  }
+  if (normalized.includes("vlm")) {
+    return "VLM";
+  }
+  if (
+    normalized.includes("speech") ||
+    normalized.includes("tts") ||
+    normalized.includes("audio")
+  ) {
+    return "TTS";
+  }
+  if (normalized.includes("waiting")) {
+    return "Waiting";
+  }
+  if (normalized.includes("sending") || normalized.includes("sent")) {
+    return "Sending";
+  }
+  if (
+    normalized.includes("fail") ||
+    normalized.includes("error") ||
+    normalized.includes("unavailable")
+  ) {
+    return "Error";
+  }
+
+  return humanizeState(rawStage);
 }
 
 function renderLatestDashboard(): void {
@@ -829,35 +1111,6 @@ function renderSystemDashboard(
   setTextCell(
     statusTotalFramesEl,
     String(selectedSession ? selectedSession.total_frames : 0),
-    true
-  );
-
-  const directionalContext = selectedSession?.latest_processed_directional ?? null;
-  const directionalSampleCount = selectedSession?.directional_samples_received ?? 0;
-  if (!selectedSession) {
-    setBadgeCell(statusDirectionalLinkEl, "N/A", "neutral");
-  } else {
-    setBadgeCell(
-      statusDirectionalLinkEl,
-      formatDirectionalLinkLabel(directionalContext, directionalSampleCount),
-      toneForDirectionalLink(directionalContext, directionalSampleCount)
-    );
-  }
-
-  setTextCell(statusDirectionalAgeEl, selectedSession ? formatDirectionalAge(directionalContext) : "n/a", true);
-  setTextCell(
-    statusDirectionalSamplesEl,
-    String(selectedSession ? selectedSession.directional_samples_received : 0),
-    true
-  );
-  setTextCell(
-    statusDirectionalErrorsEl,
-    String(selectedSession ? selectedSession.directional_parse_errors : 0),
-    true
-  );
-  setTextCell(
-    statusDirectionalIgnoredEl,
-    String(selectedSession ? selectedSession.directional_messages_ignored : 0),
     true
   );
 }
@@ -938,6 +1191,7 @@ async function refreshAdminPreviewSnapshot(): Promise<void> {
 function clearAdminLivePreview(message: string): void {
   adminLivePreviewEl.hidden = true;
   adminLivePreviewEl.removeAttribute("src");
+  adminLivePreviewEl.style.removeProperty("--admin-preview-aspect-ratio");
   showAdminLiveStatus(message);
 }
 
@@ -946,281 +1200,302 @@ function showAdminLiveStatus(message: string): void {
   adminLiveStatusEl.hidden = false;
 }
 
-function resetRelativeDirectionState(): void {
-  headingOriginAlphaDeg = null;
-  headingCurrentAlphaDeg = null;
-  headingSmoothedAlphaDeg = null;
-  pitchOriginBetaDeg = null;
-  pitchCurrentBetaDeg = null;
-  pitchSmoothedBetaDeg = null;
-  displayedRelativeHeadingDeg = null;
-  displayedRelativePitchDeg = null;
-}
-
-function recenterDirectionOrigin(): void {
-  const recenterHeading = headingSmoothedAlphaDeg ?? headingCurrentAlphaDeg;
-  const recenterPitch = pitchSmoothedBetaDeg ?? pitchCurrentBetaDeg;
-  const canRecenterHeading = recenterHeading !== null;
-  const canRecenterPitch = recenterPitch !== null;
-  if (!canRecenterHeading && !canRecenterPitch) {
-    renderRelativeDirectionWidget();
-    return;
-  }
-
-  if (recenterHeading !== null) {
-    headingOriginAlphaDeg = recenterHeading;
-  }
-  if (recenterPitch !== null) {
-    pitchOriginBetaDeg = recenterPitch;
-  }
-  displayedRelativeHeadingDeg = 0;
-  displayedRelativePitchDeg = 0;
-  renderRelativeDirectionWidget();
-  logger.log("Direction origin recentered");
-}
-
-function renderRelativeDirectionWidget(): void {
-  const headingSample = headingSmoothedAlphaDeg ?? headingCurrentAlphaDeg;
-  const pitchSample = pitchSmoothedBetaDeg ?? pitchCurrentBetaDeg;
-  const hasDirectionalSample = headingSample !== null || pitchSample !== null;
-  directionResetEl.disabled = !activeStream || !hasDirectionalSample;
-
+function startQuestionRecording(): void {
   if (!activeStream) {
-    displayedRelativeHeadingDeg = null;
-    displayedRelativePitchDeg = null;
-    updateRelativeHeadingDisplay(
-      null,
-      "--",
-      "Start feed to calibrate origin."
-    );
-    updateRelativePitchDisplay(
-      null,
-      "Pitch --",
-      "^v At origin",
-      "Keep device level to calibrate tilt."
-    );
+    throw new Error("Start the feed before recording a question");
+  }
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Wait for the data channel to connect before asking a question");
+  }
+  if (questionRecognition) {
+    throw new Error("Question recording is already in progress");
+  }
+
+  const Recognition = getSpeechRecognitionConstructor();
+  if (!Recognition) {
+    setAnswerOutput("Voice recognition is unavailable in this browser.");
+    setQuestionStatus("Voice recognition is unavailable in this browser.");
+    throw new Error("Speech recognition is not available in this browser");
+  }
+
+  const recognition = new Recognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language || "en-US";
+  questionTranscript = "";
+  discardQuestionTranscript = false;
+  questionRecordingStopPending = false;
+
+  recognition.onresult = (event) => {
+    const transcript = collectSpeechTranscript(event.results);
+    questionTranscript = transcript;
+    if (transcript) {
+      setQuestionTranscript(transcript, false);
+    }
+  };
+
+  recognition.onerror = (event) => {
+    logger.log(`Speech recognition error: ${event.error ?? event.message ?? "unknown error"}`);
+  };
+
+  recognition.onend = () => {
+    questionRecognition = null;
+    const transcript = questionTranscript.trim();
+    const shouldDiscard = discardQuestionTranscript;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+
+    if (shouldDiscard) {
+      return;
+    }
+
+    if (!transcript) {
+      setQuestionStatus(
+        webrtc.isReadyToSend() ? "No question heard. Try recording again." : "idle"
+      );
+      setQuestionTranscript("No question heard.", true);
+      setAnswerOutput("No answer yet.");
+      logger.log("No speech transcript captured");
+      return;
+    }
+
+    try {
+      sendQuestionText(transcript);
+    } catch (error) {
+      setQuestionStatus("Question send failed.");
+      setAnswerOutput("Question send failed.");
+      logger.log(`Question send failed: ${formatErrorMessage(error)}`);
+    }
+  };
+
+  questionRecognition = recognition;
+  try {
+    recognition.start();
+  } catch (error) {
+    questionRecognition = null;
+    questionTranscript = "";
+    discardQuestionTranscript = false;
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+    throw error;
+  }
+
+  setQuestionStatus("listening");
+  setQuestionTranscript("Listening...", true);
+  setAnswerOutput("No answer yet.");
+  renderQuestionRecorder();
+  logger.log("Listening for question...");
+}
+
+async function stopQuestionRecording(): Promise<void> {
+  if (!questionRecognition) {
+    throw new Error("No active question recording");
+  }
+  if (questionRecordingStopPending) {
     return;
   }
 
-  const unavailableReason = getDirectionalUnavailableReason();
+  questionRecordingStopPending = true;
+  setQuestionStatus("Stopping recording and sending question...");
+  setAnswerOutput("Processing...");
+  renderQuestionRecorder();
+  try {
+    questionRecognition.stop();
+  } catch (error) {
+    questionRecordingStopPending = false;
+    renderQuestionRecorder();
+    throw error;
+  }
+}
 
-  if (headingSample === null || headingOriginAlphaDeg === null) {
-    displayedRelativeHeadingDeg = null;
-    updateRelativeHeadingDisplay(
-      null,
-      "--",
-      unavailableReason ?? "Calibrating heading..."
-    );
-  } else {
-    const relativeHeadingRaw = computeRelativeHeadingDegrees(
-      headingSample,
-      headingOriginAlphaDeg
-    );
-    const relativeHeading = applyHeadingDeadband(
-      relativeHeadingRaw,
-      displayedRelativeHeadingDeg,
-      HEADING_JITTER_DEADBAND_DEG
-    );
-    displayedRelativeHeadingDeg = relativeHeading;
-    updateRelativeHeadingDisplay(
-      relativeHeading,
-      formatSignedDegrees(relativeHeading),
-      describeRelativeHeading(relativeHeading)
-    );
+function resetQuestionRecorder(): void {
+  if (questionRecognition) {
+    discardQuestionTranscript = true;
+    questionRecognition.abort();
+  }
+  questionRecognition = null;
+  questionTranscript = "";
+  questionRecordingStopPending = false;
+  renderQuestionRecorder();
+}
+
+function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null {
+  const speechWindow = window as SpeechRecognitionWindow;
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+}
+
+function collectSpeechTranscript(results: SpeechRecognitionResultListLike): string {
+  const parts: string[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const alternative = results[index][0];
+    const transcript = alternative?.transcript.trim();
+    if (transcript) {
+      parts.push(transcript);
+    }
   }
 
-  if (pitchSample === null || pitchOriginBetaDeg === null) {
-    displayedRelativePitchDeg = null;
-    updateRelativePitchDisplay(
-      null,
-      "Pitch --",
-      "^v Calibrating",
-      unavailableReason ?? "Calibrating tilt..."
-    );
+  return parts.join(" ").trim();
+}
+
+function sendQuestionText(text: string): void {
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Connection closed before the question was sent");
+  }
+
+  const normalizedText = text.trim();
+  if (!normalizedText) {
+    throw new Error("No question text captured");
+  }
+
+  setQuestionStatus("waiting");
+  setAnswerOutput("Processing...");
+  const sent = webrtc.sendJson({ type: "question_text", text: normalizedText });
+  if (!sent) {
+    throw new Error("Data channel is not open");
+  }
+  markQuestionSent();
+  setQuestionStatus("Question sent. Waiting for assistant response...");
+  logger.log(`Question text sent: ${normalizedText}`);
+}
+
+function playReturnedAudio(audioBase64: string): void {
+  void playReturnedAudioAsync(audioBase64).catch((error: unknown) => {
+    setQuestionStatus("Audio playback failed. Showing text response.");
+    logger.log(`Audio playback failed: ${formatErrorMessage(error)}`);
+  });
+}
+
+async function playReturnedAudioAsync(audioBase64: string): Promise<void> {
+  const audioBytes = base64ToArrayBuffer(audioBase64);
+  stopAudioResponsePlayback();
+  setQuestionStatus("Playing audio response...");
+
+  if (await playAudioBuffer(audioBytes)) {
     return;
   }
 
-  const relativePitchRaw = computeRelativePitchDegrees(
-    pitchSample,
-    pitchOriginBetaDeg
+  await playAudioElement(audioBytes).catch((error: unknown) => {
+    setQuestionStatus("Audio playback failed. Showing text response.");
+    logger.log(`Audio playback failed: ${formatErrorMessage(error)}`);
+  });
+}
+
+function unlockAudioResponsePlayback(): void {
+  const context = getAudioResponseContext();
+  if (!context) {
+    return;
+  }
+
+  if (!audioResponseUnlocked) {
+    try {
+      const buffer = context.createBuffer(1, 1, 22050);
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      source.start(0);
+      audioResponseUnlocked = true;
+    } catch (error) {
+      logger.log(`Audio unlock failed: ${formatErrorMessage(error)}`);
+    }
+  }
+
+  if (context.state === "suspended") {
+    void context.resume().catch((error: unknown) => {
+      logger.log(`Audio resume failed: ${formatErrorMessage(error)}`);
+    });
+  }
+}
+
+function getAudioResponseContext(): AudioContext | null {
+  if (audioResponseContext) {
+    return audioResponseContext;
+  }
+
+  const audioWindow = window as AudioContextWindow;
+  const AudioContextConstructor = window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextConstructor) {
+    return null;
+  }
+
+  audioResponseContext = new AudioContextConstructor();
+  return audioResponseContext;
+}
+
+async function playAudioBuffer(audioBytes: ArrayBuffer): Promise<boolean> {
+  const context = getAudioResponseContext();
+  if (!context) {
+    return false;
+  }
+
+  try {
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    if (context.state !== "running") {
+      return false;
+    }
+
+    const audioBuffer = await context.decodeAudioData(audioBytes.slice(0));
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+    source.onended = () => {
+      if (audioResponseSource === source) {
+        audioResponseSource = null;
+      }
+    };
+    source.start(0);
+    audioResponseSource = source;
+    return true;
+  } catch (error) {
+    logger.log(`Web Audio playback failed: ${formatErrorMessage(error)}`);
+    return false;
+  }
+}
+
+async function playAudioElement(audioBytes: ArrayBuffer): Promise<void> {
+  audioResponseObjectUrl = URL.createObjectURL(
+    new Blob([audioBytes], { type: "audio/mpeg" })
   );
-  const relativePitch = applyLinearDeadband(
-    relativePitchRaw,
-    displayedRelativePitchDeg,
-    PITCH_JITTER_DEADBAND_DEG
-  );
-  displayedRelativePitchDeg = relativePitch;
-  updateRelativePitchDisplay(
-    relativePitch,
-    `Pitch ${formatSignedDegrees(relativePitch)}`,
-    describeRelativePitchArrow(relativePitch),
-    describeRelativePitch(relativePitch)
-  );
+  const player = new Audio(audioResponseObjectUrl);
+  player.preload = "auto";
+  audioResponsePlayer = player;
+  await player.play();
 }
 
-function updateRelativeHeadingDisplay(
-  relativeHeadingDeg: number | null,
-  valueLabel: string,
-  detailLabel: string
-): void {
-  const rotation = relativeHeadingDeg ?? 0;
-  directionNeedleEl.style.transform = `translate(-50%, -100%) rotate(${rotation.toFixed(1)}deg)`;
-  directionRelativeValueEl.textContent = valueLabel;
-  directionRelativeTextEl.textContent = detailLabel;
-}
-
-function updateRelativePitchDisplay(
-  relativePitchDeg: number | null,
-  valueLabel: string,
-  arrowLabel: string,
-  detailLabel: string
-): void {
-  directionPitchValueEl.textContent = valueLabel;
-  directionPitchArrowEl.textContent = arrowLabel;
-  directionPitchTextEl.textContent = detailLabel;
-
-  const hasPitch = relativePitchDeg !== null;
-  directionPitchValueEl.classList.toggle("is-unavailable", !hasPitch);
-}
-
-function getDirectionalUnavailableReason(): string | null {
-  const orientationUnsupported = orientationPermissionState === "unsupported";
-  const motionUnsupported = motionPermissionState === "unsupported";
-  if (orientationUnsupported && motionUnsupported) {
-    return "Direction unavailable on this browser.";
+function stopAudioResponsePlayback(): void {
+  if (audioResponseSource) {
+    try {
+      audioResponseSource.stop();
+    } catch {
+      // The source may already have ended.
+    }
+    audioResponseSource.disconnect();
+    audioResponseSource = null;
   }
 
-  const orientationDenied = orientationPermissionState === "denied";
-  const motionDenied = motionPermissionState === "denied";
-  if (orientationDenied && motionDenied) {
-    return "Direction blocked: sensor permission denied.";
+  if (audioResponsePlayer) {
+    audioResponsePlayer.pause();
+    audioResponsePlayer.removeAttribute("src");
+    audioResponsePlayer.load();
+    audioResponsePlayer = null;
   }
 
-  return null;
-}
-
-function normalizeHeadingDegrees(value: number): number {
-  const normalized = value % 360;
-  return normalized < 0 ? normalized + 360 : normalized;
-}
-
-function clampSmoothingAlpha(alpha: number): number {
-  if (!Number.isFinite(alpha)) {
-    return 1;
+  if (audioResponseObjectUrl) {
+    URL.revokeObjectURL(audioResponseObjectUrl);
+    audioResponseObjectUrl = null;
   }
-  if (alpha <= 0) {
-    return 0;
-  }
-  if (alpha >= 1) {
-    return 1;
-  }
-  return alpha;
 }
 
-function toSignedHeadingDelta(deltaDeg: number): number {
-  const normalizedDelta = normalizeHeadingDegrees(deltaDeg);
-  return normalizedDelta > 180 ? normalizedDelta - 360 : normalizedDelta;
-}
-
-function smoothCircularDegrees(
-  previousDeg: number | null,
-  nextDeg: number,
-  alpha: number
-): number {
-  if (previousDeg === null) {
-    return nextDeg;
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = window.atob(base64.replace(/\s/g, ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
-
-  const blend = clampSmoothingAlpha(alpha);
-  const signedDelta = toSignedHeadingDelta(nextDeg - previousDeg);
-  return normalizeHeadingDegrees(previousDeg + signedDelta * blend);
-}
-
-function smoothLinearDegrees(
-  previousDeg: number | null,
-  nextDeg: number,
-  alpha: number
-): number {
-  if (previousDeg === null) {
-    return nextDeg;
-  }
-
-  const blend = clampSmoothingAlpha(alpha);
-  return previousDeg + (nextDeg - previousDeg) * blend;
-}
-
-function applyHeadingDeadband(
-  nextDeg: number,
-  previousDeg: number | null,
-  deadbandDeg: number
-): number {
-  if (previousDeg === null) {
-    return nextDeg;
-  }
-
-  const signedDelta = toSignedHeadingDelta(nextDeg - previousDeg);
-  return Math.abs(signedDelta) < deadbandDeg ? previousDeg : nextDeg;
-}
-
-function applyLinearDeadband(
-  nextDeg: number,
-  previousDeg: number | null,
-  deadbandDeg: number
-): number {
-  if (previousDeg === null) {
-    return nextDeg;
-  }
-
-  return Math.abs(nextDeg - previousDeg) < deadbandDeg ? previousDeg : nextDeg;
-}
-
-function computeRelativeHeadingDegrees(currentDeg: number, originDeg: number): number {
-  return toSignedHeadingDelta(currentDeg - originDeg);
-}
-
-function computeRelativePitchDegrees(currentDeg: number, originDeg: number): number {
-  let delta = currentDeg - originDeg;
-  if (delta > 180) {
-    delta -= 360;
-  }
-  if (delta < -180) {
-    delta += 360;
-  }
-  return delta;
-}
-
-function formatSignedDegrees(valueDeg: number): string {
-  const rounded = Math.round(valueDeg);
-  return `${rounded > 0 ? "+" : ""}${rounded} deg`;
-}
-
-function describeRelativeHeading(relativeHeadingDeg: number): string {
-  const rounded = Math.round(relativeHeadingDeg);
-  if (Math.abs(rounded) <= RELATIVE_HEADING_CENTER_BAND_DEG) {
-    return "Facing original direction.";
-  }
-
-  const directionWord = rounded > 0 ? "right" : "left";
-  return `${Math.abs(rounded)} deg ${directionWord} of origin.`;
-}
-
-function describeRelativePitch(relativePitchDeg: number): string {
-  const rounded = Math.round(relativePitchDeg);
-  if (Math.abs(rounded) <= RELATIVE_PITCH_CENTER_BAND_DEG) {
-    return "Level with original angle.";
-  }
-
-  const directionWord = rounded > 0 ? "up" : "down";
-  return `${Math.abs(rounded)} deg ${directionWord} of origin.`;
-}
-
-function describeRelativePitchArrow(relativePitchDeg: number): string {
-  const rounded = Math.round(relativePitchDeg);
-  if (Math.abs(rounded) <= RELATIVE_PITCH_CENTER_BAND_DEG) {
-    return "^v At origin";
-  }
-
-  return rounded > 0 ? "^ Up from origin" : "v Down from origin";
+  return bytes.buffer;
 }
 
 async function fetchHealthStatus(): Promise<string> {
@@ -1295,242 +1570,16 @@ function clearError(key: string): void {
   errorCache.delete(key);
 }
 
-async function resolveDirectionalPermissions(): Promise<void> {
-  if (directionalPermissionsResolved) {
-    return;
-  }
-
-  const windowWithSensorConstructors = window as Window & {
-    DeviceMotionEvent?: unknown;
-    DeviceOrientationEvent?: unknown;
-  };
-
-  const motionConstructor = windowWithSensorConstructors.DeviceMotionEvent;
-  const orientationConstructor = windowWithSensorConstructors.DeviceOrientationEvent;
-
-  motionPermissionState = await requestSensorPermission(motionConstructor);
-  orientationPermissionState = await resolveOrientationPermission(
-    orientationConstructor,
-    motionPermissionState
-  );
-  directionalPermissionsResolved = true;
-
-  if (motionPermissionState === "denied" && orientationPermissionState === "denied") {
-    logger.log("Directional telemetry unavailable: sensor permission denied.");
-  }
-}
-
-async function resolveOrientationPermission(
-  orientationConstructor: unknown,
-  motionPermission: SensorPermissionState
-): Promise<SensorPermissionState> {
-  if (!orientationConstructor) {
-    return "unsupported";
-  }
-
-  if (hasPermissionRequestMethod(orientationConstructor)) {
-    if (motionPermission === "granted" || motionPermission === "denied") {
-      return motionPermission;
-    }
-  }
-
-  return requestSensorPermission(orientationConstructor);
-}
-
-function hasPermissionRequestMethod(
-  eventConstructor: unknown
-): eventConstructor is { requestPermission: () => Promise<string> } {
-  return (
-    (typeof eventConstructor === "function" || typeof eventConstructor === "object") &&
-    eventConstructor !== null &&
-    typeof (eventConstructor as { requestPermission?: unknown }).requestPermission ===
-      "function"
-  );
-}
-
-async function requestSensorPermission(eventConstructor: unknown): Promise<SensorPermissionState> {
-  if (!eventConstructor) {
-    return "unsupported";
-  }
-
-  if (!hasPermissionRequestMethod(eventConstructor)) {
-    return "granted";
-  }
-
-  try {
-    const result = await eventConstructor.requestPermission();
-    return result === "granted" ? "granted" : "denied";
-  } catch {
-    return "denied";
-  }
-}
-
-function startDirectionalTelemetry(): void {
-  if (directionalTelemetryActive) {
-    return;
-  }
-
-  const canListenMotion = motionPermissionState === "granted";
-  const canListenOrientation = orientationPermissionState === "granted";
-  if (!canListenMotion && !canListenOrientation) {
-    if (
-      motionPermissionState === "unsupported" &&
-      orientationPermissionState === "unsupported"
-    ) {
-      logger.log("Directional telemetry unavailable: no sensor support in this browser.");
-    }
-    renderRelativeDirectionWidget();
-    return;
-  }
-
-  directionalTelemetryActive = true;
-  latestRotationRateDps = null;
-  latestOrientationDegrees = null;
-  lastDirectionalTelemetrySentAtMs = 0;
-
-  if (canListenMotion) {
-    window.addEventListener("devicemotion", handleDirectionalDeviceMotion, {
-      passive: true
-    });
-  }
-  if (canListenOrientation) {
-    window.addEventListener("deviceorientation", handleDirectionalDeviceOrientation, {
-      passive: true
-    });
-  }
-
-  const sources: string[] = [];
-  if (canListenMotion) {
-    sources.push("gyro");
-  }
-  if (canListenOrientation) {
-    sources.push("orientation");
-  }
-  logger.log(`Directional telemetry active (${sources.join(", ")})`);
-  renderRelativeDirectionWidget();
-}
-
-function stopDirectionalTelemetry(): void {
-  if (!directionalTelemetryActive) {
-    return;
-  }
-
-  directionalTelemetryActive = false;
-  window.removeEventListener("devicemotion", handleDirectionalDeviceMotion);
-  window.removeEventListener("deviceorientation", handleDirectionalDeviceOrientation);
-  latestRotationRateDps = null;
-  latestOrientationDegrees = null;
-  lastDirectionalTelemetrySentAtMs = 0;
-  renderRelativeDirectionWidget();
-}
-
-function handleDirectionalDeviceMotion(event: DeviceMotionEvent): void {
-  if (!directionalTelemetryActive) {
-    return;
-  }
-
-  const rotationRate = event.rotationRate;
-  if (!rotationRate) {
-    return;
-  }
-
-  latestRotationRateDps = {
-    alpha: toFiniteNumberOrNull(rotationRate.alpha),
-    beta: toFiniteNumberOrNull(rotationRate.beta),
-    gamma: toFiniteNumberOrNull(rotationRate.gamma)
-  };
-  maybeSendDirectionalTelemetry(Date.now());
-}
-
-function handleDirectionalDeviceOrientation(event: DeviceOrientationEvent): void {
-  if (!directionalTelemetryActive) {
-    return;
-  }
-
-  const normalizedHeading = toFiniteNumberOrNull(event.alpha);
-  const normalizedPitch = toFiniteNumberOrNull(event.beta);
-  if (normalizedHeading !== null) {
-    headingCurrentAlphaDeg = normalizeHeadingDegrees(normalizedHeading);
-    headingSmoothedAlphaDeg = smoothCircularDegrees(
-      headingSmoothedAlphaDeg,
-      headingCurrentAlphaDeg,
-      HEADING_SMOOTHING_ALPHA
-    );
-    if (headingOriginAlphaDeg === null) {
-      headingOriginAlphaDeg = headingSmoothedAlphaDeg;
-    }
-  }
-  if (normalizedPitch !== null) {
-    pitchCurrentBetaDeg = normalizedPitch;
-    pitchSmoothedBetaDeg = smoothLinearDegrees(
-      pitchSmoothedBetaDeg,
-      pitchCurrentBetaDeg,
-      PITCH_SMOOTHING_ALPHA
-    );
-    if (pitchOriginBetaDeg === null) {
-      pitchOriginBetaDeg = pitchSmoothedBetaDeg;
-    }
-  }
-
-  latestOrientationDegrees = {
-    alpha: normalizedHeading,
-    beta: normalizedPitch,
-    gamma: toFiniteNumberOrNull(event.gamma),
-    absolute: typeof event.absolute === "boolean" ? event.absolute : null
-  };
-  renderRelativeDirectionWidget();
-  maybeSendDirectionalTelemetry(Date.now());
-}
-
-function maybeSendDirectionalTelemetry(timestampMs: number): void {
-  if (!directionalTelemetryActive) {
-    return;
-  }
-
-  if (timestampMs - lastDirectionalTelemetrySentAtMs < SENSOR_TELEMETRY_INTERVAL_MS) {
-    return;
-  }
-
-  const payload = buildDirectionalTelemetryPayload(timestampMs);
-  if (!payload) {
-    return;
-  }
-
-  if (webrtc.sendJson(payload)) {
-    lastDirectionalTelemetrySentAtMs = timestampMs;
-  }
-}
-
-function buildDirectionalTelemetryPayload(
-  timestampMs: number
-): DirectionalTelemetryMessage | null {
-  if (!latestRotationRateDps && !latestOrientationDegrees) {
-    return null;
-  }
-
-  return {
-    type: "client_sensor",
-    sensor: "gyro",
-    timestamp_ms: timestampMs,
-    rotation_rate_dps: latestRotationRateDps ? { ...latestRotationRateDps } : null,
-    orientation_deg: latestOrientationDegrees ? { ...latestOrientationDegrees } : null
-  };
-}
-
-function toFiniteNumberOrNull(value: number | null): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return null;
-  }
-
-  return value;
-}
-
 function handleInferencePayload(rawPayload: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawPayload);
   } catch {
     logger.log(`Data message: ${rawPayload}`);
+    return;
+  }
+
+  if (handleAssistantPayload(parsed, rawPayload)) {
     return;
   }
 
@@ -1546,4 +1595,56 @@ function handleInferencePayload(rawPayload: string): void {
   }
 
   logger.log(`Inference tick: ${message.timestamp}`);
+}
+
+function handleAssistantPayload(parsed: unknown, rawPayload: string): boolean {
+  if (typeof parsed !== "object" || parsed === null) {
+    return false;
+  }
+
+  const candidate = parsed as Record<string, unknown>;
+  const messageType = candidate.type;
+  if (messageType === "status") {
+    const status = typeof candidate.status === "string" ? candidate.status : null;
+    const message = typeof candidate.message === "string" ? candidate.message : null;
+    setQuestionStatus(
+      message ?? status ?? "processing",
+      true,
+      status ?? message ?? "processing"
+    );
+    if (message) {
+      logger.log(message);
+    }
+    return true;
+  }
+
+  if (messageType === "error") {
+    const message = typeof candidate.message === "string" ? candidate.message : rawPayload;
+    markQuestionResponseReceived();
+    setQuestionStatus(message);
+    setAnswerOutput(message);
+    logger.log(message);
+    return true;
+  }
+
+  if (messageType !== "answer") {
+    return false;
+  }
+
+  if (typeof candidate.transcript === "string" && candidate.transcript.trim()) {
+    setQuestionTranscript(candidate.transcript, false);
+  }
+  if (typeof candidate.answer === "string") {
+    setAnswerOutput(candidate.answer);
+  }
+  markQuestionResponseReceived();
+  setQuestionStatus("complete");
+
+  if (typeof candidate.audio_error === "string" && candidate.audio_error.trim()) {
+    logger.log(`Speech unavailable: ${candidate.audio_error}`);
+  }
+  if (typeof candidate.audio_base64 === "string" && candidate.audio_base64.length > 0) {
+    playReturnedAudio(candidate.audio_base64);
+  }
+  return true;
 }

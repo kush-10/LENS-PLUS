@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
+import logging
 import math
 import os
 import uuid
@@ -20,6 +22,17 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
+
+from .llm import (
+    OllamaCompletionError,
+    generate_assistant_answer,
+    prompt_audit_enabled,
+    update_prompt_audit,
+)
+from .model_context import ModelContextWaitResult, wait_for_prior_complete_group
+from .scene_context import build_scene_context
+from .tts import AudioProcessingError, text_to_speech_bytes
+from .vlm import VisionModelError, query_image_model
 
 
 class OfferRequest(BaseModel):
@@ -58,8 +71,18 @@ MAX_ANALYSIS_TARGET_FPS = 30.0
 FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
 MAX_INFERENCE_SAMPLE_AGE_MS = 3000
-MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
 GROUP_SESSION_TIME_CUT_SECONDS = 10 # seconds
+ENABLE_MOCK_RESULTS = os.getenv("ENABLE_MOCK_RESULTS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DEFAULT_FALLBACK_ANSWER = (
+    "I cannot reach the full assistant right now, but I will keep monitoring the scene."
+)
+STRUCTURED_CONTEXT_NOT_READY_MESSAGE = "Structured scene context is not ready yet."
+logger = logging.getLogger("lens-plus.api")
 
 
 def clamp_analysis_fps(value: float) -> float:
@@ -99,6 +122,7 @@ class Session:
     peer_connection: RTCPeerConnection
     data_channel: Any | None = None
     frame_task: asyncio.Task[None] | None = None
+    question_task: asyncio.Task[None] | None = None
     mock_task: asyncio.Task[None] | None = None
     analysis_target_fps: float = CONFIGURED_ANALYSIS_TARGET_FPS
     total_frames: int = 0
@@ -118,17 +142,11 @@ class Session:
     dumped_frames: int = 0
     dump_errors: int = 0
     last_dump_error: str | None = None
-    directional_samples_received: int = 0
-    directional_messages_ignored: int = 0
-    directional_parse_errors: int = 0
-    latest_directional_sample: dict[str, Any] | None = None
-    latest_directional_received_at: datetime | None = None
-    latest_directional_client_timestamp_ms: int | None = None
-    latest_processed_directional: dict[str, Any] | None = None
     inference_messages_emitted: int = 0
     latest_inference_payload: dict[str, Any] | None = None
     latest_inference_at: datetime | None = None
     latest_processed_detections: dict[str, Any] | None = None
+    last_answered_frame_index: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -166,10 +184,19 @@ def read_int_env(name: str, default: int) -> int:
 
 SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.05))
 SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92)))
+MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS = max(
+    0.0,
+    read_float_env("MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS", 120.0),
+)
+MODEL_CONTEXT_POLL_SECONDS = max(
+    0.05,
+    read_float_env("MODEL_CONTEXT_POLL_SECONDS", 0.5),
+)
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
     av.logging.set_level(av.logging.ERROR)
     SESSION_ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
     app.state.gc_task = asyncio.create_task(session_gc())
@@ -223,18 +250,6 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                 "dumped_frames": session.dumped_frames,
                 "dump_errors": session.dump_errors,
                 "last_dump_error": session.last_dump_error,
-                "directional_samples_received": session.directional_samples_received,
-                "directional_messages_ignored": session.directional_messages_ignored,
-                "directional_parse_errors": session.directional_parse_errors,
-                "latest_directional_received_at": (
-                    session.latest_directional_received_at.isoformat()
-                    if session.latest_directional_received_at
-                    else None
-                ),
-                "latest_directional_client_timestamp_ms": (
-                    session.latest_directional_client_timestamp_ms
-                ),
-                "latest_processed_directional": session.latest_processed_directional,
                 "inference_messages_emitted": session.inference_messages_emitted,
                 "latest_inference_at": (
                     session.latest_inference_at.isoformat()
@@ -242,6 +257,7 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                     else None
                 ),
                 "latest_processed_detections": session.latest_processed_detections,
+                "last_answered_frame_index": session.last_answered_frame_index,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
@@ -368,11 +384,6 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                     next_analysis_at = now_mono + analysis_interval_seconds
                     session.processed_frames += 1
                     window_processed_frames += 1
-                    directional_context = build_directional_context_for_frame(
-                        session=session,
-                        frame_at=now,
-                    )
-                    session.latest_processed_directional = directional_context
                     detection_context = build_detection_context_for_frame(
                         session=session,
                         frame_at=now,
@@ -391,7 +402,6 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                             session=session,
                             frame_jpeg=processed_frame_jpeg,
                             frame_at=now,
-                            directional_context=directional_context,
                             detection_context=detection_context,
                         )
                     else:
@@ -413,11 +423,15 @@ async def offer(payload: OfferRequest) -> OfferResponse:
 
         @channel.on("message")
         def on_message(message: Any) -> None:
-            ingest_directional_message(session=session, message=message)
+            asyncio.create_task(handle_data_channel_message(session=session, message=message))
 
         @channel.on("open")
         def on_open() -> None:
-            if session.mock_task is None:
+            if ENABLE_MOCK_RESULTS and session.mock_task is None:
+                session.mock_task = asyncio.create_task(send_mock_results(session))
+
+        if getattr(channel, "readyState", "") == "open":
+            if ENABLE_MOCK_RESULTS and session.mock_task is None:
                 session.mock_task = asyncio.create_task(send_mock_results(session))
 
     @peer_connection.on("connectionstatechange")
@@ -495,6 +509,477 @@ async def ingest_inference(
     return IceResponse(ok=True)
 
 
+async def send_data_channel_json(session: Session, payload: dict[str, Any]) -> bool:
+    channel = session.data_channel
+    if channel is None or getattr(channel, "readyState", "") != "open":
+        return False
+
+    try:
+        channel.send(json.dumps(payload))
+        session.updated_at = datetime.now(timezone.utc)
+        return True
+    except Exception as error:
+        logger.warning("Data-channel send failed: %s", error)
+        return False
+
+
+async def send_status(session: Session, status: str, message: str) -> None:
+    await send_data_channel_json(
+        session,
+        {
+            "type": "status",
+            "status": status,
+            "message": message,
+        },
+    )
+
+
+async def send_error(session: Session, message: str) -> None:
+    await send_data_channel_json(
+        session,
+        {
+            "type": "error",
+            "message": message,
+        },
+    )
+
+
+async def send_answer(
+    session: Session,
+    *,
+    transcript: str,
+    answer: str,
+    audio_base64: str | None = None,
+    audio_error: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "type": "answer",
+        "transcript": transcript,
+        "answer": answer,
+    }
+    if audio_base64:
+        payload["audio_base64"] = audio_base64
+    if audio_error:
+        payload["audio_error"] = audio_error
+    await send_data_channel_json(session, payload)
+
+
+async def handle_data_channel_message(session: Session, message: Any) -> None:
+    payload = decode_data_channel_message(message)
+    if payload is None:
+        await send_error(session, "Failed to parse data-channel message")
+        return
+
+    if not isinstance(payload, dict):
+        await send_error(session, "Invalid data-channel message payload")
+        return
+
+    message_type = payload.get("type")
+    if message_type in {"question_audio", "question_audio_chunk"}:
+        await send_error(
+            session,
+            "Audio uploads are not supported. Send question_text instead.",
+        )
+        return
+
+    if message_type == "question_text":
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            await send_error(session, "No question text provided")
+            return
+        start_question_task(
+            session=session,
+            text=text,
+            question_received_at=datetime.now(timezone.utc),
+        )
+        return
+
+    await send_error(session, f"Unknown data-channel message type: {message_type}")
+
+
+def decode_data_channel_message(message: Any) -> Any | None:
+    payload: Any = message
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+    return payload
+
+
+def start_question_task(
+    session: Session,
+    text: str,
+    question_received_at: datetime,
+) -> None:
+    existing_task = session.question_task
+    if existing_task is not None and not existing_task.done():
+        logger.info("Question rejected because another question is active text_len=%d", len(text))
+        asyncio.create_task(
+            send_error(session, "A question is already being processed. Please wait.")
+        )
+        return
+
+    logger.info("Starting assistant question task text_len=%d", len(text))
+    task = asyncio.create_task(
+        run_question_pipeline(
+            session=session,
+            text=text,
+            question_received_at=question_received_at,
+        )
+    )
+    session.question_task = task
+
+    def clear_finished_task(finished_task: asyncio.Task[None]) -> None:
+        if session.question_task is finished_task:
+            session.question_task = None
+
+    task.add_done_callback(clear_finished_task)
+
+
+def create_prompt_audit_path(session: Session) -> Path | None:
+    if not prompt_audit_enabled() or session.artifact_dir is None:
+        return None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        session.artifact_dir
+        / "question-audits"
+        / f"question-{timestamp}-{uuid.uuid4().hex[:8]}.json"
+    )
+
+
+def safe_update_prompt_audit(
+    prompt_audit_path: Path | None,
+    updates: dict[str, Any],
+) -> None:
+    if prompt_audit_path is None:
+        return
+
+    try:
+        update_prompt_audit(prompt_audit_path, updates)
+    except Exception as error:
+        logger.warning("Prompt audit write failed: %s", error)
+
+
+async def run_question_pipeline(
+    session: Session,
+    text: str,
+    question_received_at: datetime,
+) -> None:
+    logger.info(
+        "Assistant pipeline started transcript_len=%d has_frame=%s artifact_id=%s",
+        len(text),
+        session.latest_jpeg is not None,
+        session.artifact_id,
+    )
+    await send_status(session, "received_question", "Question received.")
+
+    if session.latest_jpeg is None:
+        logger.warning("Assistant pipeline aborted: no latest frame available")
+        await send_error(session, "No image frame available yet")
+        return
+
+    image_bytes = session.latest_jpeg
+    image_source = "latest_session_jpeg"
+    question_max_frame_index = session.processed_frames
+    prompt_audit_path = create_prompt_audit_path(session)
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "type": "llm_prompt_audit",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "session": {
+                "artifact_id": session.artifact_id,
+                "artifact_dir": str(session.artifact_dir) if session.artifact_dir else None,
+            },
+            "question": {
+                "text": text,
+                "chars": len(text),
+                "received_at": question_received_at.isoformat(),
+                "max_frame_index_at_question": question_max_frame_index,
+            },
+            "vlm_image_source": image_source,
+        },
+    )
+
+    await send_status(session, "running_vlm", "Inspecting the latest camera frame.")
+    logger.info("Running VLM stage image_bytes=%d question_len=%d", len(image_bytes), len(text))
+    vlm_task = asyncio.create_task(query_image_model(image_bytes, text))
+
+    await send_status(
+        session,
+        "waiting_model_context",
+        "Waiting for the latest complete processed frame group.",
+    )
+    model_context_task = asyncio.create_task(
+        wait_for_prior_complete_group(
+            artifact_dir=session.artifact_dir,
+            session_started_at=session.started_at,
+            question_received_at=question_received_at,
+            group_duration_seconds=GROUP_SESSION_TIME_CUT_SECONDS,
+            timeout_seconds=MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS,
+            poll_seconds=MODEL_CONTEXT_POLL_SECONDS,
+        )
+    )
+
+    try:
+        model_context = await model_context_task
+    except Exception as error:
+        logger.warning("Structured model context wait failed: %s", error)
+        model_context = ModelContextWaitResult(
+            ready=False,
+            status="failed",
+            reason=f"Structured model context wait failed: {error}",
+            waited_seconds=0.0,
+        )
+
+    if model_context.ready:
+        await send_status(
+            session,
+            "model_context_ready",
+            f"Using processed frame group {model_context.selected_group}.",
+        )
+    else:
+        await send_status(
+            session,
+            "model_context_unavailable",
+            "Structured context is not ready; using the visual model only.",
+        )
+
+    scene_context = build_scene_context(
+        artifact_dir=session.artifact_dir,
+        latest_jpeg_at=session.latest_jpeg_at,
+        latest_frame_at=session.last_frame_at,
+        latest_detection_context=session.latest_processed_detections,
+        frame_paths=list(model_context.frame_paths) if model_context.ready else [],
+    )
+    scene_context["frame"]["vlm_image_source"] = image_source
+    scene_context["structured_context_ready"] = model_context.ready
+    scene_context["structured_model_context"] = model_context.to_audit_dict()
+    if not model_context.ready:
+        scene_context["missing_context"].append("structured_model_context")
+        scene_context["warnings"].append(STRUCTURED_CONTEXT_NOT_READY_MESSAGE)
+
+    missing_context = scene_context.get("missing_context")
+    logger.info(
+        "Scene context loaded missing_context=%s frame_window=%s image_source=%s model_context=%s audit_path=%s",
+        missing_context,
+        scene_context.get("frame_window"),
+        image_source,
+        model_context.to_audit_dict(),
+        str(prompt_audit_path) if prompt_audit_path else None,
+    )
+
+    vlm_text: str | None = None
+    try:
+        vlm_text = await vlm_task
+        logger.info("VLM stage completed vlm_chars=%d", len(vlm_text))
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "text": vlm_text,
+                    "text_chars": len(vlm_text),
+                }
+            },
+        )
+    except VisionModelError as error:
+        scene_context["warnings"].append(f"VLM unavailable: {error}")
+        logger.warning("VLM stage unavailable: %s", error)
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "error": str(error),
+                }
+            },
+        )
+        await send_status(
+            session,
+            "running_llm",
+            "Visual model unavailable; using available context.",
+        )
+    except Exception as error:
+        scene_context["warnings"].append(f"VLM failed: {error}")
+        logger.warning("VLM stage failed: %s", error)
+        safe_update_prompt_audit(
+            prompt_audit_path,
+            {
+                "vlm": {
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "image_source": image_source,
+                    "error": str(error),
+                }
+            },
+        )
+        await send_status(
+            session,
+            "running_llm",
+            "Visual model failed; using available context.",
+        )
+
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "model_context": model_context.to_audit_dict(),
+            "frame_window": scene_context.get("frame_window"),
+            "scene_context": scene_context,
+        },
+    )
+
+    await send_status(session, "running_llm", "Composing a navigation answer.")
+
+    logger.info("Running Ollama/Qwen answer stage")
+    answer_source = "ollama"
+    try:
+        answer = await generate_assistant_answer(
+            question=text,
+            scene_context=scene_context,
+            vlm_text=vlm_text,
+            prompt_audit_path=prompt_audit_path,
+        )
+        logger.info("Ollama/Qwen answer stage completed answer_chars=%d", len(answer))
+    except OllamaCompletionError as error:
+        scene_context["warnings"].append(f"Ollama unavailable: {error}")
+        logger.warning("Ollama/Qwen answer stage unavailable: %s", error)
+        answer_source = "fallback"
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+    except Exception as error:
+        scene_context["warnings"].append(f"Ollama failed: {error}")
+        logger.warning("Ollama/Qwen answer stage failed: %s", error)
+        answer_source = "fallback"
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+
+    if not answer.strip():
+        answer_source = "fallback"
+        answer = build_fallback_answer(scene_context=scene_context, vlm_text=vlm_text)
+
+    if not model_context.ready:
+        answer = ensure_structured_context_warning(answer)
+
+    await send_status(session, "generating_speech", "Generating speech.")
+    logger.info("Running TTS stage answer_chars=%d", len(answer))
+    audio_base64: str | None = None
+    audio_error: str | None = None
+    try:
+        audio_bytes = await text_to_speech_bytes(answer)
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        logger.info("TTS stage completed audio_bytes=%d", len(audio_bytes))
+    except AudioProcessingError as error:
+        audio_error = str(error)
+        logger.warning("TTS stage unavailable: %s", error)
+    except Exception as error:
+        audio_error = f"Speech generation failed: {error}"
+        logger.warning("TTS stage failed: %s", error)
+
+    await send_answer(
+        session,
+        transcript=text,
+        answer=answer,
+        audio_base64=audio_base64,
+        audio_error=audio_error,
+    )
+    if model_context.ready and model_context.last_frame_index is not None:
+        session.last_answered_frame_index = max(
+            session.last_answered_frame_index,
+            model_context.last_frame_index,
+        )
+    safe_update_prompt_audit(
+        prompt_audit_path,
+        {
+            "pipeline_result": {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "answer_source": answer_source,
+                "answer": answer,
+                "answer_chars": len(answer),
+                "last_answered_frame_index": session.last_answered_frame_index,
+                "structured_context_ready": model_context.ready,
+                "audio_generated": audio_base64 is not None,
+                "audio_error": audio_error,
+            }
+        },
+    )
+    logger.info(
+        "Assistant pipeline completed answer_chars=%d audio=%s",
+        len(answer),
+        "yes" if audio_base64 else "no",
+    )
+
+
+def build_fallback_answer(
+    *, scene_context: dict[str, Any], vlm_text: str | None
+) -> str:
+    if isinstance(vlm_text, str) and vlm_text.strip():
+        return vlm_text.strip()
+
+    parts: list[str] = []
+    depth = scene_context.get("depth")
+    if isinstance(depth, dict):
+        proximity_detail = depth.get("proximity_detail")
+        proximity_status = depth.get("proximity_status")
+        if isinstance(proximity_detail, str) and proximity_detail:
+            parts.append(proximity_detail)
+        elif isinstance(proximity_status, str) and proximity_status:
+            parts.append(f"Depth status is {proximity_status.lower()}.")
+
+    segmentation = scene_context.get("segmentation")
+    if isinstance(segmentation, dict):
+        walkable_status = segmentation.get("walkable_status")
+        direction = segmentation.get("direction")
+        if isinstance(walkable_status, str) and isinstance(direction, str):
+            parts.append(f"Segmentation says {walkable_status.lower()}; suggested direction is {direction.lower()}.")
+
+    detections = extract_fallback_detection_labels(scene_context)
+    if detections:
+        parts.append(f"Detected nearby objects include {', '.join(detections[:4])}.")
+
+    if parts:
+        return " ".join(parts)[:420]
+    return DEFAULT_FALLBACK_ANSWER
+
+
+def ensure_structured_context_warning(answer: str) -> str:
+    cleaned = answer.strip()
+    if STRUCTURED_CONTEXT_NOT_READY_MESSAGE.lower() in cleaned.lower():
+        return cleaned
+    if not cleaned:
+        return STRUCTURED_CONTEXT_NOT_READY_MESSAGE
+    return f"{STRUCTURED_CONTEXT_NOT_READY_MESSAGE} {cleaned}"
+
+
+def extract_fallback_detection_labels(scene_context: dict[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+    object_detection = scene_context.get("object_detection")
+    if isinstance(object_detection, dict) and isinstance(object_detection.get("detections"), list):
+        candidates = object_detection["detections"]
+
+    if not candidates:
+        live_detections = scene_context.get("live_detections")
+        if isinstance(live_detections, dict) and isinstance(live_detections.get("objects"), list):
+            candidates = live_detections["objects"]
+
+    labels: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        label = candidate.get("label")
+        if isinstance(label, str) and label and label not in labels:
+            labels.append(label)
+    return labels
+
+
 async def send_mock_results(session: Session) -> None:
     object_labels = ["chair", "desk", "door", "bag", "keys", "person"]
     while True:
@@ -513,7 +998,6 @@ async def send_mock_results(session: Session) -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "guidance_text": f"Caution: {label} ahead.",
             "scene_summary": f"Detected one {label} in view.",
-            "directional": session.latest_processed_directional,
             "objects": [
                 {
                     "label": label,
@@ -532,141 +1016,6 @@ async def send_mock_results(session: Session) -> None:
             break
 
         await asyncio.sleep(1)
-
-
-def ingest_directional_message(session: Session, message: Any) -> None:
-    payload: Any = message
-    if isinstance(payload, bytes):
-        try:
-            payload = payload.decode("utf-8")
-        except UnicodeDecodeError:
-            session.directional_parse_errors += 1
-            return
-
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
-            session.directional_parse_errors += 1
-            return
-
-    normalized_payload = normalize_directional_payload(payload)
-    if normalized_payload is None:
-        session.directional_messages_ignored += 1
-        return
-
-    now = datetime.now(timezone.utc)
-    session.directional_samples_received += 1
-    session.latest_directional_sample = normalized_payload
-    session.latest_directional_received_at = now
-    session.latest_directional_client_timestamp_ms = normalized_payload["timestamp_ms"]
-    session.updated_at = now
-
-
-def normalize_directional_payload(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, dict):
-        return None
-
-    if payload.get("type") != "client_sensor":
-        return None
-
-    if payload.get("sensor") != "gyro":
-        return None
-
-    timestamp_ms = coerce_optional_int(payload.get("timestamp_ms"))
-    rotation_rate_dps = normalize_rotation_rate(payload.get("rotation_rate_dps"))
-    orientation_deg = normalize_orientation(payload.get("orientation_deg"))
-
-    if rotation_rate_dps is None and orientation_deg is None:
-        return None
-
-    return {
-        "timestamp_ms": timestamp_ms,
-        "rotation_rate_dps": rotation_rate_dps,
-        "orientation_deg": orientation_deg,
-    }
-
-
-def normalize_rotation_rate(value: Any) -> dict[str, float | None] | None:
-    if not isinstance(value, dict):
-        return None
-
-    alpha = coerce_finite_float(value.get("alpha"))
-    beta = coerce_finite_float(value.get("beta"))
-    gamma = coerce_finite_float(value.get("gamma"))
-    if alpha is None and beta is None and gamma is None:
-        return None
-
-    return {
-        "alpha": alpha,
-        "beta": beta,
-        "gamma": gamma,
-    }
-
-
-def normalize_orientation(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-
-    alpha = coerce_finite_float(value.get("alpha"))
-    beta = coerce_finite_float(value.get("beta"))
-    gamma = coerce_finite_float(value.get("gamma"))
-    absolute = value.get("absolute") if isinstance(value.get("absolute"), bool) else None
-    if alpha is None and beta is None and gamma is None and absolute is None:
-        return None
-
-    return {
-        "alpha": alpha,
-        "beta": beta,
-        "gamma": gamma,
-        "absolute": absolute,
-    }
-
-
-def coerce_finite_float(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-
-    if isinstance(value, (int, float)) and math.isfinite(value):
-        return float(value)
-
-    return None
-
-
-def coerce_optional_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-
-    if isinstance(value, int):
-        return value
-
-    if isinstance(value, float) and math.isfinite(value):
-        return int(value)
-
-    return None
-
-
-def build_directional_context_for_frame(
-    session: Session,
-    frame_at: datetime,
-) -> dict[str, Any] | None:
-    latest_directional_sample = session.latest_directional_sample
-    latest_directional_received_at = session.latest_directional_received_at
-    if latest_directional_sample is None or latest_directional_received_at is None:
-        return None
-
-    age_ms = max(
-        0,
-        int(round((frame_at - latest_directional_received_at).total_seconds() * 1000)),
-    )
-    return {
-        "sample_timestamp_ms": latest_directional_sample.get("timestamp_ms"),
-        "server_received_at": latest_directional_received_at.isoformat(),
-        "age_ms": age_ms,
-        "is_stale": age_ms > MAX_DIRECTIONAL_SAMPLE_AGE_MS,
-        "rotation_rate_dps": latest_directional_sample.get("rotation_rate_dps"),
-        "orientation_deg": latest_directional_sample.get("orientation_deg"),
-    }
 
 
 def update_latest_inference(session: Session, payload: dict[str, Any]) -> None:
@@ -771,7 +1120,7 @@ async def close_session(session_id: str) -> None:
 
     closed_at = datetime.now(timezone.utc)
 
-    for task in [session.frame_task, session.mock_task]:
+    for task in [session.frame_task, session.question_task, session.mock_task]:
         if task:
             task.cancel()
 
@@ -1024,7 +1373,6 @@ def persist_processed_frame(
     session: Session,
     frame_jpeg: bytes,
     frame_at: datetime,
-    directional_context: dict[str, Any] | None,
     detection_context: dict[str, Any] | None,
 ) -> None:
     if session.artifact_dir is None:
@@ -1056,7 +1404,6 @@ def persist_processed_frame(
         "frame_at": frame_at.isoformat(),
         "group_id": group_number,
         "group_dir": group_dir.name,
-        "directional": directional_context,
         "detections": detection_context,
         "object-detected": object_detected,
     }
@@ -1093,18 +1440,6 @@ def build_session_manifest(
         "dumped_frames": session.dumped_frames,
         "dump_errors": session.dump_errors,
         "last_dump_error": session.last_dump_error,
-        "directional_samples_received": session.directional_samples_received,
-        "directional_messages_ignored": session.directional_messages_ignored,
-        "directional_parse_errors": session.directional_parse_errors,
-        "latest_directional_received_at": (
-            session.latest_directional_received_at.isoformat()
-            if session.latest_directional_received_at
-            else None
-        ),
-        "latest_directional_client_timestamp_ms": (
-            session.latest_directional_client_timestamp_ms
-        ),
-        "latest_processed_directional": session.latest_processed_directional,
         "inference_messages_emitted": session.inference_messages_emitted,
         "latest_inference_at": (
             session.latest_inference_at.isoformat()
@@ -1112,6 +1447,7 @@ def build_session_manifest(
             else None
         ),
         "latest_processed_detections": session.latest_processed_detections,
+        "last_answered_frame_index": session.last_answered_frame_index,
         "latest_jpeg_at": (
             session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
         ),

@@ -17,12 +17,22 @@ from ultralytics import YOLO
 BASE_DIR     = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[1]
 APP_DIR      = PROJECT_ROOT / "api" / "app"
+sys.path.insert(0, str(APP_DIR))
+
+from compute_device import select_torch_device, yolo_device_from_torch_device
 
 OUTPUT_DIR   = BASE_DIR / "output"
 OUTPUT_WIDTH  = 640
 OUTPUT_HEIGHT = 360
 
 DEMO_BATCH_SIZE = 2
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2))
+    temporary_path.replace(path)
 
 def natural_key(path: Path) -> list:
     return [
@@ -62,12 +72,13 @@ class ObjectDetector:
         self.target_fps  = target_fps
         self.conf        = conf
         self.write_video = write_video
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.yolo_device = 0 if self.device == "cuda" else "cpu"
+        self.device      = select_torch_device(component_env_var="LENS_DETECTION_DEVICE")
+        self.yolo_device = yolo_device_from_torch_device(self.device)
 
         print(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
-        print(f"Model loaded. Object detection device: {self.device}")
+        self.model.to(self.device)
+        print(f"Model loaded. ObjectDetector using device: {self.device}")
 
     def find_latest_artifact(self) -> Path:
         artifacts = [p for p in self.frames_root.iterdir() if p.is_dir()]
@@ -228,12 +239,12 @@ class ObjectDetector:
                     }
 
                     sidecar = frame_path.with_suffix(".detections.json")
-                    sidecar.write_text(json.dumps({
+                    write_json_atomic(sidecar, {
                         "frame": frame_path.name,
                         "timestamp": frame_path.stem.split("-")[-1],
                         "detections": detections,
                         "metrics": frame_metrics,
-                    }, indent=2))
+                    })
 
                     if out is not None:
                         annotated = results[0].plot()
@@ -350,7 +361,7 @@ class ObjectDetector:
                     results = self.process_group(frame_paths, video_path)
                     results["group"]    = group.name
                     results["artifact"] = artifact.name
-                    json_path.write_text(json.dumps(results, indent=2) + "\n")
+                    write_json_atomic(json_path, results)
                     print(f"  JSON: {json_path.name}")
 
                     processed_groups.add(key)
@@ -413,5 +424,3 @@ if __name__ == "__main__":
         write_video=not args.no_video,
     )
     detector.run()
-
-

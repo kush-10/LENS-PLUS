@@ -1,8 +1,27 @@
 import fs from "node:fs";
+import path from "node:path";
 import { defineConfig, loadEnv } from "vite";
 
+const workspaceRoot = path.resolve(process.cwd(), "..");
+
+function resolveExistingFile(filePath: string): string | undefined {
+  const candidates = path.isAbsolute(filePath)
+    ? [filePath]
+    : [path.resolve(process.cwd(), filePath), path.resolve(workspaceRoot, filePath)];
+
+  if (filePath.startsWith("/app/")) {
+    candidates.push(path.resolve(process.cwd(), filePath.slice("/app/".length)));
+  }
+
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "");
+  const env = {
+    ...loadEnv(mode, workspaceRoot, ""),
+    ...loadEnv(mode, process.cwd(), ""),
+    ...process.env
+  };
   const useHttps = env.DEV_HTTPS === "true";
 
   let https: { key: Buffer; cert: Buffer } | undefined;
@@ -16,13 +35,16 @@ export default defineConfig(({ mode }) => {
       );
     }
 
-    if (!fs.existsSync(keyFile) || !fs.existsSync(certFile)) {
+    const resolvedKeyFile = resolveExistingFile(keyFile);
+    const resolvedCertFile = resolveExistingFile(certFile);
+
+    if (!resolvedKeyFile || !resolvedCertFile) {
       throw new Error("HTTPS cert or key file not found");
     }
 
     https = {
-      key: fs.readFileSync(keyFile),
-      cert: fs.readFileSync(certFile)
+      key: fs.readFileSync(resolvedKeyFile),
+      cert: fs.readFileSync(resolvedCertFile)
     };
   }
 
