@@ -102,6 +102,37 @@ python models/object_detection/scripts/run_latency_benchmark.py --model models/o
 | Video file | `some_clip.mp4` |
 | Backend snapshot URL | `http://localhost:8000/debug/sessions/<session_id>/latest.jpg` |
 
+## LLM Question Benchmark
+
+This summarises Ollama/Qwen latency, token usage, context readiness, answer source, and audio generation from real web-app question artifacts. It also writes a PNG dashboard with latency, token, throughput, prompt-size, and outcome graphs when `matplotlib` is installed.
+
+Run against the latest session that has `question-audits/`:
+
+```bash
+python models/metrics_summary/run_llm_question_summary.py --latest
+```
+
+Run against a specific session artifact:
+
+```bash
+python models/metrics_summary/run_llm_question_summary.py --artifact 20260504T120000000000Z--demo
+```
+
+Watch live sessions and refresh the summary as questions finish:
+
+```bash
+python models/metrics_summary/run_llm_question_summary.py --watch
+```
+
+The summary files are written to:
+
+```text
+api/app/session_artifacts/<session>/metrics_summaries/llm-questions.summary.json
+api/app/session_artifacts/<session>/metrics_summaries/llm-questions.summary.png
+```
+
+Key aggregate fields include `pipeline_wall_ms`, `llm_wall_ms`, `ollama_total_ms`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `completion_tokens_per_second`, `model_context_wait_ms`, `answer_chars`, and `context_chars`.
+
 ## Robustness Evaluation
 
 This evaluates blur, brightness, contrast, JPEG artifacts, and noise perturbations.

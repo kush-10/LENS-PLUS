@@ -30,6 +30,8 @@ Session artifacts include:
 | `group-*/frame-*.navigation.json` | Segmentation and depth navigation sidecars from the model pipeline |
 | `session.json` | Session counters, timestamps, dump status, and latest detection state |
 | `question-audits/` | Optional prompt and answer audits when `ENABLE_LLM_PROMPT_AUDIT=true` |
+| `metrics_summaries/llm-questions.summary.json` | Optional LLM question benchmark summary generated from question audits |
+| `metrics_summaries/llm-questions.summary.png` | Optional LLM question benchmark graph dashboard |
 
 `frame-*.json` includes frame identifiers, timestamps, detection objects, detection metrics, inference timestamp, staleness, and related metadata.
 

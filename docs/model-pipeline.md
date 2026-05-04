@@ -40,6 +40,7 @@ The integration flow is:
 6. A group is ready only when every frame in it has object detection, segmentation, and depth sidecars.
 7. If no prior group exists, or if the selected group is still incomplete after `MODEL_CONTEXT_WAIT_TIMEOUT_SECONDS`, the API answers with VLM-only context and marks structured context as not ready.
 8. The API sends structured context plus VLM text to Ollama/Qwen, then returns text and TTS audio over the data channel.
+9. The metrics summary watcher writes frame-group summaries and LLM question JSON/PNG summaries under `metrics_summaries/`.
 
 The old `send_mock_results()` path remains available only when `ENABLE_MOCK_RESULTS=true`.
 

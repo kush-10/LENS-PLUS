@@ -10,6 +10,7 @@ OBJ_DETECTION_SCRIPT = BASE_DIR / "object_detection" / "run_live_detection.py"
 SEGMENTATION_SCRIPT = BASE_DIR / "segmentation" / "src" / "segmentation-live-feed.py"
 DEPTH_SCRIPT = BASE_DIR / "depth_estimation" / "depth_estimator.py"
 SUMMARY_SCRIPT = BASE_DIR / "metrics_summary" / "run_group_pair_summary.py"
+LLM_SUMMARY_SCRIPT = BASE_DIR / "metrics_summary" / "run_llm_question_summary.py"
 
 def launch_process(script_path: Path, extra_args: list[str] | None = None) -> subprocess.Popen:
     args = [sys.executable, str(script_path)]
@@ -45,6 +46,7 @@ def main():
         "Segmentation": (SEGMENTATION_SCRIPT, extra_args),
         "Depth Estimation": (DEPTH_SCRIPT, extra_args),
         "Metrics Summary": (SUMMARY_SCRIPT, []),
+        "LLM Question Summary": (LLM_SUMMARY_SCRIPT, ["--watch"]),
     }
 
     processes: dict[str, subprocess.Popen] = {}

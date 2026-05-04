@@ -43,6 +43,7 @@ Implemented model-pipeline behavior:
 | Entry point | Runs `models/start_pipeline.py --no-video` |
 | Artifact watcher | Watches API frame artifacts |
 | Sidecars | Writes object detection, segmentation, and depth sidecars |
+| Metrics summaries | Writes frame-group and LLM question summaries under session artifacts |
 | Assistant context | Sidecars are consumed by the API when answering questions |
 
 ## Repository Layout
