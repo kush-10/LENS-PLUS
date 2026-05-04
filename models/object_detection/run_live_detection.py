@@ -4,12 +4,14 @@ import re
 import json
 import time
 import argparse
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 BASE_DIR     = Path(__file__).resolve().parent
@@ -20,7 +22,7 @@ OUTPUT_DIR   = BASE_DIR / "output"
 OUTPUT_WIDTH  = 640
 OUTPUT_HEIGHT = 360
 
-DEMO_BATCH_SIZE = 3
+DEMO_BATCH_SIZE = 2
 
 def natural_key(path: Path) -> list:
     return [
@@ -36,6 +38,18 @@ def read_and_resize(path: Path) -> np.ndarray | None:
     return None
 
 class ObjectDetector:
+    HAZARD_LABELS = {
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "bus",
+        "train",
+        "truck",
+        "traffic light",
+        "stop sign",
+    }
+
     def __init__(
         self,
         frames_root: str,
@@ -48,10 +62,12 @@ class ObjectDetector:
         self.target_fps  = target_fps
         self.conf        = conf
         self.write_video = write_video
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.yolo_device = 0 if self.device == "cuda" else "cpu"
 
         print(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
-        print("Model loaded.")
+        print(f"Model loaded. Object detection device: {self.device}")
 
     def find_latest_artifact(self) -> Path:
         artifacts = [p for p in self.frames_root.iterdir() if p.is_dir()]
@@ -114,55 +130,137 @@ class ObjectDetector:
 
         frame_summaries = []
         total_detections = 0
+        prev_label_counter: Counter[str] | None = None
+        running_label_counter: Counter[str] = Counter()
+        running_hazard_counter: Counter[str] = Counter()
 
-        for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
-            if frame is None:
-                continue
+        try:
+            for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
+                try:
+                    if frame is None:
+                        continue
 
-            frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-            t0 = time.perf_counter()
-            results = self.model(frame, conf=self.conf, verbose=False)
-            latency_ms = (time.perf_counter() - t0) * 1000
+                    t0 = time.perf_counter()
+                    results = self.model(
+                        frame,
+                        conf=self.conf,
+                        verbose=False,
+                        device=self.yolo_device,
+                    )
+                    latency_ms = (time.perf_counter() - t0) * 1000
 
-            detections = []
+                    detections = []
 
-            if results[0].boxes is not None:
-                for box in results[0].boxes:
-                    xyxy    = box.xyxy[0].tolist()
-                    conf    = float(box.conf[0])
-                    cls_id  = int(box.cls[0])
-                    label   = self.model.names[cls_id]
-                    detections.append({
-                        "label":      label,
-                        "confidence": round(conf, 3),
-                        "xyxy":       [round(v, 1) for v in xyxy],
+                    if results[0].boxes is not None:
+                        for box in results[0].boxes:
+                            xyxy = box.xyxy[0].tolist()
+                            conf = float(box.conf[0])
+                            cls_id = int(box.cls[0])
+                            label = self.model.names[cls_id]
+                            detections.append({
+                                "label": label,
+                                "confidence": round(conf, 3),
+                                "xyxy": [round(v, 1) for v in xyxy],
+                            })
+
+                    label_counter = Counter(d["label"] for d in detections)
+                    running_label_counter.update(label_counter)
+
+                    hazard_label_counts = {
+                        label: count for label, count in sorted(label_counter.items())
+                        if label in self.HAZARD_LABELS
+                    }
+                    running_hazard_counter.update(hazard_label_counts)
+
+                    confidences = [d["confidence"] for d in detections]
+                    avg_conf = round(float(np.mean(confidences)), 4) if confidences else None
+                    max_conf = round(max(confidences), 4) if confidences else None
+                    min_conf = round(min(confidences), 4) if confidences else None
+
+                    previous_instances = sum(prev_label_counter.values()) if prev_label_counter else 0
+                    persisting_instances = 0
+                    if prev_label_counter:
+                        persisting_instances = sum(
+                            min(label_counter.get(label, 0), prev_label_counter.get(label, 0))
+                            for label in set(label_counter) | set(prev_label_counter)
+                        )
+                    persistence_rate = (
+                        round(persisting_instances / previous_instances, 4)
+                        if previous_instances > 0 else None
+                    )
+
+                    current_labels = set(label_counter)
+                    previous_labels = set(prev_label_counter) if prev_label_counter else set()
+                    new_labels = sorted(current_labels - previous_labels)
+                    dropped_labels = sorted(previous_labels - current_labels)
+
+                    total_frame_detections = len(detections)
+                    total_running_detections = sum(running_label_counter.values())
+                    hazard_detection_count = sum(hazard_label_counts.values())
+                    running_hazard_count = sum(running_hazard_counter.values())
+
+                    frame_metrics = {
+                        "inference_latency_ms": round(latency_ms, 2),
+                        "num_detections": total_frame_detections,
+                        "avg_confidence": avg_conf,
+                        "max_confidence": max_conf,
+                        "min_confidence": min_conf,
+                        "detection_persistence_rate": persistence_rate,
+                        "persisting_detection_instances": persisting_instances,
+                        "previous_frame_detection_instances": previous_instances,
+                        "new_detection_labels": new_labels,
+                        "dropped_detection_labels": dropped_labels,
+                        "hazard_class_frequency": hazard_label_counts,
+                        "hazard_detection_ratio": (
+                            round(hazard_detection_count / total_frame_detections, 4)
+                            if total_frame_detections > 0 else 0.0
+                        ),
+                        "running_hazard_class_frequency": {
+                            label: round(count / max(1, running_hazard_count), 4)
+                            for label, count in sorted(running_hazard_counter.items())
+                        },
+                        "label_counts": dict(sorted(label_counter.items())),
+                        "running_label_counts": dict(sorted(running_label_counter.items())),
+                        "running_frame_index": len(frame_summaries) + 1,
+                        "running_total_detections": total_running_detections,
+                    }
+
+                    sidecar = frame_path.with_suffix(".detections.json")
+                    sidecar.write_text(json.dumps({
+                        "frame": frame_path.name,
+                        "timestamp": frame_path.stem.split("-")[-1],
+                        "detections": detections,
+                        "metrics": frame_metrics,
+                    }, indent=2))
+
+                    if out is not None:
+                        annotated = results[0].plot()
+                        annotated = cv2.resize(annotated, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                        out.write(annotated)
+
+                    total_detections += len(detections)
+
+                    labels_str = ", ".join(d["label"] for d in detections) if detections else "none"
+                    print(
+                        f"  [{frame_path.name}] {len(detections)} detection(s): "
+                        f"{labels_str}  ({latency_ms:.0f}ms)"
+                    )
+
+                    frame_summaries.append({
+                        "frame": frame_path.name,
+                        "detections": detections,
+                        "metrics": frame_metrics,
                     })
 
-            sidecar = frame_path.with_suffix(".detections.json")
-            sidecar.write_text(json.dumps({"detections": detections}, indent=2))
-
+                    prev_label_counter = label_counter
+                except Exception as error:
+                    print(f"  [Detection] Frame failed: {frame_path.name} - {error}")
+                    continue
+        finally:
             if out is not None:
-                annotated = results[0].plot()
-                annotated = cv2.resize(annotated, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-                out.write(annotated)
-
-            total_detections += len(detections)
-
-            labels_str = ", ".join(d["label"] for d in detections) if detections else "none"
-            print(
-                f"  [{frame_path.name}] {len(detections)} detection(s): "
-                f"{labels_str}  ({latency_ms:.0f}ms)"
-            )
-
-            frame_summaries.append({
-                "frame":              frame_path.name,
-                "detections":         detections,
-                "inference_latency_ms": round(latency_ms, 2),
-            })
-
-        if out is not None:
-            out.release()
+                out.release()
 
         return {
             "total_frames":      len(frame_summaries),
@@ -202,12 +300,21 @@ class ObjectDetector:
         last_new_group_time = time.time()
         demo_batch_num    = 1
         last_merged_count = 0
+        active_artifact: Path | None = None
 
         while True:
             try:
-                artifact = self.find_latest_artifact()
+                if active_artifact is None:
+                    active_artifact = self.find_latest_artifact()
+                    print(f"[Detection] Tracking session: {active_artifact.name}")
+                artifact = active_artifact
             except FileNotFoundError:
                 print("Waiting for a session to start...")
+                time.sleep(2)
+                continue
+
+            if not artifact.exists():
+                active_artifact = None
                 time.sleep(2)
                 continue
 
@@ -266,6 +373,28 @@ class ObjectDetector:
                     last_merged_count += unmerged
                     demo_batch_num    += 1
 
+            # Stay on one artifact until it is fully processed.
+            pending = False
+            for group in groups:
+                key = f"{artifact.name}_{group.name}"
+                if key in processed_groups:
+                    continue
+                if self.load_frame_paths(group):
+                    pending = True
+                    break
+
+            if is_closed and not pending:
+                try:
+                    latest_artifact = self.find_latest_artifact()
+                except FileNotFoundError:
+                    latest_artifact = artifact
+                if latest_artifact != artifact:
+                    print(f"[Detection] Switching to new session: {latest_artifact.name}")
+                    active_artifact = latest_artifact
+                    processed_order = []
+                    last_merged_count = 0
+                    demo_batch_num = 1
+
             time.sleep(2)
 
 def _parse_args():
@@ -284,3 +413,5 @@ if __name__ == "__main__":
         write_video=not args.no_video,
     )
     detector.run()
+
+
